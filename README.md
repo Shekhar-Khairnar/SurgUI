@@ -1,6 +1,6 @@
 <h1 align="center">
 Surgical Video Annotation Software
-</h1>
+</h1> 
 
 <h1 align="center">
   <img src="samples/Picture1.png">
@@ -15,7 +15,7 @@ A graphical video annotation tool, originally developed for labeling surgical vi
 - extracting and saving important frames such as critical views
 - pixel-level annotation of the images by opening in [labelme](https://github.com/wkentaro/labelme/) software
 
-## Requirements
+## Requirements 
 
 - Python 3
 - VLC media-player
@@ -33,9 +33,7 @@ A graphical video annotation tool, originally developed for labeling surgical vi
 ```shell
 pip install pyqt5 python-vlc opencv-python labelme
 ```
-
-or
-
+or 
 ```shell
 pip install -r requirements.txt
 ```
@@ -49,7 +47,6 @@ python3 setup.py install
 ## Usage
 
 run the software:
-
 ```shell
 surgui
 or
@@ -59,6 +56,7 @@ python surgui/vidPlayer.py
 For annotating the start and end of segments, create the .txt file containing the list of segments. Example files can be found in samples folder. In the software, create a timestamping panel by opening the text file. For each video that is playing, a folder with the same name is created in “outputs” directory. By pressing the save button, for each segment, a line will be added to a file in the output folder.
 
 The saved images and the .json files from labelme annotations are stored in “images” folder for each video.
+
 
 ## TODO
 

@@ -20,6 +20,14 @@ setup(
         "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",
     ],
+    install_requires=[
+        'PyQt5',
+        'opencv-python',
+        'python-vlc',
+        'labelme',
+        # Add other dependencies here
+    ],
     packages=find_packages(),
+    include_package_data=True,
     entry_points={"console_scripts": ["surgui = surgui.__main__:main"]},
 )
