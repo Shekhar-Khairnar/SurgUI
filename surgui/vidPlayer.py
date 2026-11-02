@@ -69,19 +69,39 @@ class Slider(QSlider):
         self.setValue(value)
 
 
-class TimeLabel(QLabel):
-    """Start or end time in a panel row. Clicking it jumps the video to that time."""
+class TimeEdit(QLineEdit):
+    """Start or end time in a panel row.
 
-    clicked = pyqtSignal(str)
+    Click it to type a new time and press Enter (Escape cancels). Double-click
+    it to jump the video to that time.
+    """
+
+    jump = pyqtSignal(str)
 
     def __init__(self, text):
         super().__init__(text)
-        self.setCursor(Qt.PointingHandCursor)
-        self.setToolTip("Click to jump the video to this time")
+        self.committed = text  # the time in effect, while a new one is being typed
+        self.setToolTip("Click to type a new time (H:MM:SS), then press Enter.\nDouble-click to jump the video here.")
+        self.setStyleSheet(
+            "QLineEdit { color: white; background: transparent; border: none; }"
+            "QLineEdit:focus { background: #303030; border: 1px solid gray; }"
+        )
 
-    def mouseReleaseEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self.clicked.emit(self.text())
+    def setText(self, text):
+        super().setText(text)
+        self.committed = text
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.setText(self.committed)
+            self.clearFocus()
+        elif event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            self.clearFocus()  # applies the new time and hands the keyboard back to the player
+        else:
+            super().keyPressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        self.jump.emit(self.committed)
 
 
 class Window(QWidget):
@@ -738,18 +758,22 @@ class Window(QWidget):
 
             self.startingButtonlist[self.panel_index].append(QPushButton("starts"))
             self.startingButtonlist[self.panel_index][i].setFixedWidth(50)
-            self.startingTimelist[self.panel_index].append(TimeLabel("0"))
-            self.startingTimelist[self.panel_index][i].setStyleSheet("color: white")
-            self.startingTimelist[self.panel_index][i].clicked.connect(self.go_to_time)
+            self.startingTimelist[self.panel_index].append(TimeEdit("0"))
+            self.startingTimelist[self.panel_index][i].jump.connect(self.go_to_time)
+            self.startingTimelist[self.panel_index][i].editingFinished.connect(
+                partial(self.on_time_edited, self.panel_index, i, "start")
+            )
             self.startingButtonlist[self.panel_index][i].clicked.connect(
                 partial(self.onstartbuttonClicked, self.panel_index, i)
             )
 
             self.endingButtonlist[self.panel_index].append(QPushButton("ends"))
             self.endingButtonlist[self.panel_index][i].setFixedWidth(50)
-            self.endingTimelist[self.panel_index].append(TimeLabel("0"))
-            self.endingTimelist[self.panel_index][i].setStyleSheet("color: white")
-            self.endingTimelist[self.panel_index][i].clicked.connect(self.go_to_time)
+            self.endingTimelist[self.panel_index].append(TimeEdit("0"))
+            self.endingTimelist[self.panel_index][i].jump.connect(self.go_to_time)
+            self.endingTimelist[self.panel_index][i].editingFinished.connect(
+                partial(self.on_time_edited, self.panel_index, i, "end")
+            )
             self.endingButtonlist[self.panel_index][i].clicked.connect(
                 partial(self.onendbuttonClicked, self.panel_index, i)
             )
@@ -914,18 +938,22 @@ class Window(QWidget):
 
             self.startingButtonlist[self.panel_index].append(QPushButton("starts"))
             self.startingButtonlist[self.panel_index][i].setFixedWidth(50)
-            self.startingTimelist[self.panel_index].append(TimeLabel("0"))
-            self.startingTimelist[self.panel_index][i].setStyleSheet("color: white")
-            self.startingTimelist[self.panel_index][i].clicked.connect(self.go_to_time)
+            self.startingTimelist[self.panel_index].append(TimeEdit("0"))
+            self.startingTimelist[self.panel_index][i].jump.connect(self.go_to_time)
+            self.startingTimelist[self.panel_index][i].editingFinished.connect(
+                partial(self.on_time_edited, self.panel_index, i, "start")
+            )
             self.startingButtonlist[self.panel_index][i].clicked.connect(
                 partial(self.onstartbuttonClicked, self.panel_index, i)
             )
 
             self.endingButtonlist[self.panel_index].append(QPushButton("ends"))
             self.endingButtonlist[self.panel_index][i].setFixedWidth(50)
-            self.endingTimelist[self.panel_index].append(TimeLabel("0"))
-            self.endingTimelist[self.panel_index][i].setStyleSheet("color: white")
-            self.endingTimelist[self.panel_index][i].clicked.connect(self.go_to_time)
+            self.endingTimelist[self.panel_index].append(TimeEdit("0"))
+            self.endingTimelist[self.panel_index][i].jump.connect(self.go_to_time)
+            self.endingTimelist[self.panel_index][i].editingFinished.connect(
+                partial(self.on_time_edited, self.panel_index, i, "end")
+            )
             self.endingButtonlist[self.panel_index][i].clicked.connect(
                 partial(self.onendbuttonClicked, self.panel_index, i)
             )
@@ -1008,7 +1036,7 @@ class Window(QWidget):
         self.timer.start()
 
     def go_to_time(self, time_text):
-        """Jump the video to a time shown in a panel row (its time label was clicked)."""
+        """Jump the video to a time shown in a panel row (it was double-clicked)."""
         if self.media is not None and time_text != "0":
             self.set_time_ms(self._time_to_seconds(time_text) * 1000)
 
@@ -1116,30 +1144,56 @@ class Window(QWidget):
         return self._format_ms(self._duration_ms())
 
     def onstartbuttonClicked(self, panel_index, i):
-        value = self.getSliderValue()
+        self._set_start_time(panel_index, i, self.getSliderValue())
+
+    def onendbuttonClicked(self, panel_index, i):
+        self._set_end_time(panel_index, i, self.getSliderValue())
+
+    def _set_start_time(self, panel_index, i, value):
         error = self._check_event_times(panel_index, i, value, self.endingTimelist[panel_index][i].text())
         if error:
             QMessageBox.warning(self, "Start time not set", error)
             return
         self.startingTimelist[panel_index][i].setText(str(value))
-        self.startingTimelist[panel_index][i].setStyleSheet("color: white")
         self.endingButtonlist[panel_index][i].setEnabled(True)
         self.check_save_conditions(panel_index, i)
         self._save_rating_times_if_editing(panel_index, i)
 
-    def onendbuttonClicked(self, panel_index, i):
-        value = self.getSliderValue()
+    def _set_end_time(self, panel_index, i, value):
         error = self._check_event_times(panel_index, i, self.startingTimelist[panel_index][i].text(), value)
         if error:
             QMessageBox.warning(self, "End time not set", error)
             return
         self.endingTimelist[panel_index][i].setText(str(value))
-        self.endingTimelist[panel_index][i].setStyleSheet("color: white")
         if self.ratingButtonslist[panel_index] and len(self.ratingButtonslist[panel_index]) > i:
             for btn in self.ratingButtonslist[panel_index][i]:
                 btn.setEnabled(True)
         self.check_save_conditions(panel_index, i)
         self._save_rating_times_if_editing(panel_index, i)
+
+    def on_time_edited(self, panel_index, i, which):
+        """A new start or end time was typed into a panel row."""
+        field = (self.startingTimelist if which == "start" else self.endingTimelist)[panel_index][i]
+        typed = field.text().strip()
+        field.setText(field.committed)  # keep showing the current time until the new one is accepted
+        if typed == field.committed:
+            return
+        if not re.fullmatch(r"\d+(:\d+){0,2}", typed):
+            QMessageBox.warning(self, "Time not changed", "Type a time as hours:minutes:seconds, like 0:01:05.")
+            return
+        duration = self._duration_ms()
+        if duration and self._time_to_seconds(typed) * 1000 > duration:
+            QMessageBox.warning(
+                self, "Time not changed", "{} is after the end of the video ({}).".format(typed, self.getDurationValue())
+            )
+            return
+        value = self._format_ms(self._time_to_seconds(typed) * 1000)
+        if which == "start":
+            self._set_start_time(panel_index, i, value)
+        elif not self.endingButtonlist[panel_index][i].isEnabled():
+            QMessageBox.warning(self, "Time not changed", "Set the start time first.")
+        else:
+            self._set_end_time(panel_index, i, value)
 
     def onRatingSelected(self, panel_index, i):
         self.check_save_conditions(panel_index, i)
@@ -1309,6 +1363,10 @@ class Window(QWidget):
             self.mediaPlayer.set_rate(3)
 
     def save(self):
+        # Finish a time that's still being typed, so it's saved too
+        focused = QApplication.focusWidget()
+        if isinstance(focused, TimeEdit):
+            focused.clearFocus()
         for panel_index in range(1, self.num_panels + 1):
             # Rating panels have no save buttons: their entries are saved when a score is picked
             for i, btn in enumerate(self.saveEntryBtn[panel_index] or []):
