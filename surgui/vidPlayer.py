@@ -70,10 +70,12 @@ class Slider(QSlider):
 
 
 class TimeEdit(QLineEdit):
-    """Start or end time in a panel row.
+    """Start or end time in a panel row: "H:MM:SS", or "0" while it isn't set.
 
-    Click it to type a new time and press Enter (Escape cancels). Double-click
-    it to jump the video to that time.
+    Click it to change the time and press Enter (Escape cancels). While it's
+    being changed it shows HH:MM:SS with fixed colons, so only the digits can be
+    typed over or erased. Leaving it applies the change through editingFinished.
+    Double-click it to jump the video to that time.
     """
 
     jump = pyqtSignal(str)
@@ -81,19 +83,41 @@ class TimeEdit(QLineEdit):
     def __init__(self, text):
         super().__init__(text)
         self.committed = text  # the time in effect, while a new one is being typed
-        self.setToolTip("Click to type a new time (H:MM:SS), then press Enter.\nDouble-click to jump the video here.")
+        self.setToolTip("Click to change the time, then press Enter (Esc cancels).\nDouble-click to jump the video here.")
+        # A white input box, so it's clear the time can be edited
         self.setStyleSheet(
-            "QLineEdit { color: white; background: transparent; border: none; }"
-            "QLineEdit:focus { background: #303030; border: 1px solid gray; }"
+            "QLineEdit { color: black; background: white; border: 1px solid gray; padding: 1px 3px; }"
+            "QLineEdit:focus { border: 2px solid #3399ff; }"
         )
+        self.setFixedWidth(self.fontMetrics().boundingRect("00:00:00").width() + 24)
 
     def setText(self, text):
-        super().setText(text)
         self.committed = text
+        self._show_committed()
+
+    def _show_committed(self):
+        if self.hasFocus():
+            h, m, s = (int(p) for p in self.committed.split(":")) if ":" in self.committed else (0, 0, 0)
+            self.setInputMask("00:00:00")
+            super().setText("{:02d}:{:02d}:{:02d}".format(h, m, s))
+        else:
+            self.setInputMask("")
+            super().setText(self.committed)
+
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        self._show_committed()  # switch to the fixed HH:MM:SS form for typing
+
+    def focusOutEvent(self, event):
+        if event.reason() == Qt.PopupFocusReason:  # right-click menu: still editing
+            super().focusOutEvent(event)
+            return
+        super().focusOutEvent(event)  # emits editingFinished, which applies or rejects the typed time
+        self._show_committed()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
-            self.setText(self.committed)
+            self.setModified(False)  # nothing typed is applied
             self.clearFocus()
         elif event.key() in (Qt.Key_Return, Qt.Key_Enter):
             self.clearFocus()  # applies the new time and hands the keyboard back to the player
@@ -101,6 +125,8 @@ class TimeEdit(QLineEdit):
             super().keyPressEvent(event)
 
     def mouseDoubleClickEvent(self, event):
+        self.setModified(False)
+        self.clearFocus()
         self.jump.emit(self.committed)
 
 
@@ -1174,20 +1200,27 @@ class Window(QWidget):
     def on_time_edited(self, panel_index, i, which):
         """A new start or end time was typed into a panel row."""
         field = (self.startingTimelist if which == "start" else self.endingTimelist)[panel_index][i]
-        typed = field.text().strip()
-        field.setText(field.committed)  # keep showing the current time until the new one is accepted
-        if typed == field.committed:
-            return
-        if not re.fullmatch(r"\d+(:\d+){0,2}", typed):
-            QMessageBox.warning(self, "Time not changed", "Type a time as hours:minutes:seconds, like 0:01:05.")
-            return
-        duration = self._duration_ms()
-        if duration and self._time_to_seconds(typed) * 1000 > duration:
+        if not field.isModified():
+            return  # clicked in and out, or Escape
+        field.setModified(False)
+        typed = field.text()  # HH:MM:SS, with any erased digits missing
+        if not re.fullmatch(r"\d\d:[0-5]\d:[0-5]\d", typed):
             QMessageBox.warning(
-                self, "Time not changed", "{} is after the end of the video ({}).".format(typed, self.getDurationValue())
+                self,
+                "Time not changed",
+                "{} isn't a complete time. Fill in every digit of HH:MM:SS; "
+                "minutes and seconds go up to 59.".format(field.displayText()),
             )
             return
         value = self._format_ms(self._time_to_seconds(typed) * 1000)
+        duration = self._duration_ms()
+        if duration and self._time_to_seconds(value) * 1000 > duration:
+            QMessageBox.warning(
+                self, "Time not changed", "{} is after the end of the video ({}).".format(value, self.getDurationValue())
+            )
+            return
+        if value == field.committed:
+            return
         if which == "start":
             self._set_start_time(panel_index, i, value)
         elif not self.endingButtonlist[panel_index][i].isEnabled():
