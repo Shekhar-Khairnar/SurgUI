@@ -92,6 +92,7 @@ class Window(QWidget):
         self.instance = vlc.Instance("--no-audio")
         self.media = None
         self.mediaPlayer = self.instance.media_player_new()
+        self._last_time_ms = 0
 
         # In this widget, the video will be drawn
         if platform.system() == "Darwin":  # for MacOS
@@ -232,6 +233,7 @@ class Window(QWidget):
         self.noButtonlist = [None] * 10
         self.ratingItemlist = [None] * 10
         self.groupButtonlist = [None] * 10
+        self.overlapCheckbox = [None] * 10
 
         self.timer = QTimer(self)
         self.timer.setInterval(100)
@@ -386,6 +388,96 @@ class Window(QWidget):
             print("Could not dedupe/sort {}: {}".format(filepath, e))
 
     # =========================================================================
+    # Event time validation + per-panel "Allow overlapping events" option
+    # =========================================================================
+    def _add_overlap_checkbox(self, panel_index):
+        checkbox = QCheckBox("Allow overlapping events")
+        checkbox.setChecked(True)
+        checkbox.setStyleSheet("color: white")
+        checkbox.setToolTip(
+            "When unchecked, events in this panel can't overlap: a start or end "
+            "time that falls inside another event of this panel is rejected."
+        )
+        checkbox.toggled.connect(partial(self.on_overlap_toggled, panel_index))
+        self.overlapCheckbox[panel_index] = checkbox
+        self.formLayout[panel_index].addRow(checkbox)
+
+    def on_overlap_toggled(self, panel_index, allowed):
+        """Refuse to turn overlap off while the panel already has overlapping events."""
+        if allowed:
+            return
+        for i in range(len(self.tasklist[panel_index])):
+            start = self.startingTimelist[panel_index][i].text()
+            end = self.endingTimelist[panel_index][i].text()
+            if start == "0" and end == "0":
+                continue
+            error = self._check_event_times(panel_index, i, start, end)
+            if error:
+                QMessageBox.warning(
+                    self,
+                    "Overlapping events",
+                    error + "\n\nClear one of them before turning off overlapping events.",
+                )
+                self.overlapCheckbox[panel_index].setChecked(True)
+                return
+
+    def _check_event_times(self, panel_index, i, start_text, end_text):
+        """Return why row i can't have these start/end times, or None if they're fine."""
+        start = None if start_text == "0" else self._time_to_seconds(start_text)
+        end = None if end_text == "0" else self._time_to_seconds(end_text)
+        if start is not None and end is not None and end < start:
+            return "End time ({}) is before start time ({}).".format(end_text, start_text)
+
+        if self.overlapCheckbox[panel_index].isChecked():
+            return None
+
+        # A row with only one time set is checked as a single point in time
+        start = end if start is None else start
+        end = start if end is None else end
+        for task, other_start, other_end in self._other_events(panel_index, i):
+            # Events that only touch (one ends when the next starts) don't overlap
+            if start < self._time_to_seconds(other_end) and self._time_to_seconds(other_start) < end:
+                return "'{}' would overlap with '{}' ({} to {}).".format(
+                    self.tasklist[panel_index][i].text(), task, other_start, other_end
+                )
+        return None
+
+    def _other_events(self, panel_index, i):
+        """(task, start, end) of every event in the panel except row i.
+
+        Rows marked on screen are used as shown. Tasks that aren't marked fall
+        back to the times saved in the panel's output file, so events saved in
+        an earlier session are checked as well.
+        """
+        tasks = [label.text() for label in self.tasklist[panel_index]]
+        events = []
+        for j, task in enumerate(tasks):
+            start = self.startingTimelist[panel_index][j].text()
+            end = self.endingTimelist[panel_index][j].text()
+            if j != i and start != "0" and end != "0":
+                events.append((task, start, end))
+
+        on_screen = {task for task, _, _ in events} | {tasks[i]}
+        return events + [event for event in self._saved_events(panel_index) if event[0] not in on_screen]
+
+    def _saved_events(self, panel_index):
+        """(task, start, end) of the entries already in the panel's output file."""
+        if not self.save_directory:
+            return []
+        title = self.form_title[panel_index].text()
+        if self.groupButtonlist[panel_index]:  # rating panel
+            path = "{}/{}_scores.txt".format(self.save_directory, title)
+            pattern = r"(.*?) : .*\| Time: ([\d:]+) to ([\d:]+)$"
+        else:
+            path = "{}/{}.txt".format(self.save_directory, title)
+            pattern = r"(.*) : \(([\d:]+) , ([\d:]+)\)$"
+        if not os.path.exists(path):
+            return []
+        with open(path) as f:
+            matches = [re.match(pattern, line.strip()) for line in f]
+        return [m.groups() for m in matches if m]
+
+    # =========================================================================
     # Existing methods
     # =========================================================================
     def apply_panel_font_size_from_text(self):
@@ -415,14 +507,13 @@ class Window(QWidget):
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Space:
             self.play_video()
-        elif event.key() == Qt.Key_Right:
-            p = self.slider.value()
-            p = p + int(500000000 / self.media.get_duration())
-            self.set_position(p)
-        elif event.key() == Qt.Key_Left:
-            p = self.slider.value()
-            p = p - int(500000000 / self.media.get_duration())
-            self.set_position(p)
+        elif event.key() in (Qt.Key_Right, Qt.Key_Left):
+            duration = self._duration_ms()
+            if duration > 0:
+                step = int(5000 * 100000 / duration)  # 5 seconds in slider units
+                if event.key() == Qt.Key_Left:
+                    step = -step
+                self.set_position(min(100000, max(0, self.slider.value() + step)))
         elif event.key() == Qt.Key_F5:
             self.close()
         else:
@@ -443,6 +534,7 @@ class Window(QWidget):
             self.media = self.instance.media_new(filename)
             self.mediaPlayer.set_media(self.media)
             self.media.parse()
+            self._last_time_ms = 0
             self.setWindowTitle(self.media.get_meta(0))
 
             self.playBtn.setEnabled(True)
@@ -520,7 +612,10 @@ class Window(QWidget):
             self.playBtn.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
 
     def changeDirectory(self):
-        self.parrentDirectory = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Folder")
+        directory = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Folder")
+        if not directory:
+            return  # dialog cancelled, keep the current folder
+        self.parrentDirectory = directory
 
         if self.vidname:
             if not os.path.exists(self.parrentDirectory + "/" + self.vidname):
@@ -577,6 +672,7 @@ class Window(QWidget):
             )
 
             self.formLayout[self.panel_index].addRow(self.form_title[self.panel_index])
+            self._add_overlap_checkbox(self.panel_index)
 
             for i, line in enumerate(lines):
                 line = line.split("#")
@@ -688,6 +784,7 @@ class Window(QWidget):
             )
 
             self.formLayout[self.panel_index].addRow(self.form_title[self.panel_index])
+            self._add_overlap_checkbox(self.panel_index)
 
             for i, line in enumerate(lines):
                 parts = line.strip().split(" : ")
@@ -781,56 +878,50 @@ class Window(QWidget):
 
             self.apply_panel_font_size_from_text()
 
-        if self.save_directory:
-            scores_path = self.save_directory + "/" + self.form_title[self.panel_index].text() + "_scores.txt"
-            if os.path.exists(scores_path):
-                with open(scores_path, "r") as f:
-                    lines = f.readlines()
-                    new_lines = []
+            if self.save_directory:
+                scores_path = self.save_directory + "/" + self.form_title[self.panel_index].text() + "_scores.txt"
+                if os.path.exists(scores_path):
+                    # Restore the saved scores. Lines are "task : score | Time: start to end",
+                    # or just "task : score" in older files. The file itself is left as is.
+                    with open(scores_path, "r") as f:
+                        lines = f.readlines()
                     for line in lines:
-                        rating_item = line.split(" : ")[0]
-                        details = line.strip().split(" : ")[1]
-                        existing_score, existing_times = details.split(" | ") if " | " in details else (details, "Not set")
+                        parts = line.strip().split(" : ", 1)
+                        if len(parts) != 2:
+                            continue
+                        rating_item = parts[0]
+                        score = parts[1].split(" | ")[0].strip()
+                        if not score.isdigit():
+                            print(f"Skipping invalid score: {score}")
+                            continue
+                        for i in range(len(self.groupButtonlist[self.panel_index])):
+                            if self.tasklist[self.panel_index][i].text() == rating_item:
+                                for btn in self.ratingButtonslist[self.panel_index][i]:
+                                    if int(btn.text()) == int(score):
+                                        btn.setChecked(True)
 
-                        if len(line.split(" : ")) == 2:
-                            score = line.split(" : ")[1]
-                            for i in range(len(self.groupButtonlist[self.panel_index])):
-                                if self.tasklist[self.panel_index][i].text() == rating_item:
-                                    for j in range(len(self.ratingButtonslist[self.panel_index][i])):
-                                        if score.strip().isdigit():
-                                            if int(self.ratingButtonslist[self.panel_index][i][j].text()) == int(score):
-                                                self.ratingButtonslist[self.panel_index][i][j].setChecked(True)
-                                        else:
-                                            print(f"Skipping invalid score: {score}")
-                                    new_lines.append(
-                                        f"{rating_item} : {score} | {self.startingTimelist[self.panel_index][i].text()} to {self.endingTimelist[self.panel_index][i].text()}"
+                    # NEW: clean up the existing entries
+                    self._dedupe_and_sort_file(scores_path)
+                else:
+                    with open(scores_path, "a") as out:
+                        for i in range(len(self.groupButtonlist[self.panel_index])):
+                            starting_time = self.startingTimelist[self.panel_index][i].text()
+                            ending_time = self.endingTimelist[self.panel_index][i].text()
+                            score = None
+                            for j in range(len(self.ratingButtonslist[self.panel_index][i])):
+                                if self.ratingButtonslist[self.panel_index][i][j].isChecked():
+                                    score = self.ratingButtonslist[self.panel_index][i][j].text()
+                            if starting_time != "0" and ending_time != "0" and score is not None:
+                                out.write(
+                                    "{} : {} | Time: {} to {}\n".format(
+                                        self.tasklist[self.panel_index][i].text(),
+                                        score,
+                                        starting_time,
+                                        ending_time,
                                     )
-
-                with open(scores_path, "w") as f:
-                    f.writelines(new_lines)
-
-                # NEW: clean up after rewrite
-                self._dedupe_and_sort_file(scores_path)
-            else:
-                with open(scores_path, "a") as out:
-                    for i in range(len(self.groupButtonlist[self.panel_index])):
-                        starting_time = self.startingTimelist[self.panel_index][i].text()
-                        ending_time = self.endingTimelist[self.panel_index][i].text()
-                        score = None
-                        for j in range(len(self.ratingButtonslist[self.panel_index][i])):
-                            if self.ratingButtonslist[self.panel_index][i][j].isChecked():
-                                score = self.ratingButtonslist[self.panel_index][i][j].text()
-                        if starting_time != "0" and ending_time != "0" and score is not None:
-                            out.write(
-                                "{} : {} | Time: {} to {}\n".format(
-                                    self.tasklist[self.panel_index][i].text(),
-                                    score,
-                                    starting_time,
-                                    ending_time,
                                 )
-                            )
-                # NEW: clean up after initial write
-                self._dedupe_and_sort_file(scores_path)
+                    # NEW: clean up after initial write
+                    self._dedupe_and_sort_file(scores_path)
 
     def position_changed(self):
         self.timer.stop()
@@ -853,28 +944,64 @@ class Window(QWidget):
         self.playBtn.setEnabled(False)
         self.label.setText("Error: " + self.mediaPlayer.errorString())
 
-    def getSliderValue(self):
-        value = int(self.mediaPlayer.get_position() * (self.media.get_duration()))
-        value = value // 1000
-        mins, sec = divmod(value, 60)
+    def _duration_ms(self):
+        """Video length in ms, or 0 while it isn't known (VLC reports -1)."""
+        if self.media is None:
+            return 0
+        duration = self.media.get_duration()
+        if duration <= 0:
+            duration = self.mediaPlayer.get_length()
+        return max(0, duration)
+
+    def _current_time_ms(self):
+        """Playback time in ms, never negative.
+
+        VLC reports -1 once the player is stopped, which update_ui does when
+        the video reaches its end, so marking an end time there used to give a
+        negative time. Fall back to the last valid time instead.
+        """
+        if self.media is None:
+            return 0
+        if self.mediaPlayer.get_state() == vlc.State.Ended:
+            t = self._duration_ms() or self._last_time_ms
+        else:
+            t = self.mediaPlayer.get_time()
+            if t < 0:
+                t = self._last_time_ms
+        duration = self._duration_ms()
+        if duration:
+            t = min(t, duration)
+        self._last_time_ms = t
+        return t
+
+    def _format_ms(self, ms):
+        mins, sec = divmod(ms // 1000, 60)
         hour, mins = divmod(mins, 60)
         return "%d:%02d:%02d" % (hour, mins, sec)
 
+    def getSliderValue(self):
+        return self._format_ms(self._current_time_ms())
+
     def getDurationValue(self):
-        value = int(self.media.get_duration())
-        value = value // 1000
-        mins, sec = divmod(value, 60)
-        hour, mins = divmod(mins, 60)
-        return "%d:%02d:%02d" % (hour, mins, sec)
+        return self._format_ms(self._duration_ms())
 
     def onstartbuttonClicked(self, panel_index, i):
         value = self.getSliderValue()
+        error = self._check_event_times(panel_index, i, value, self.endingTimelist[panel_index][i].text())
+        if error:
+            QMessageBox.warning(self, "Start time not set", error)
+            return
         self.startingTimelist[panel_index][i].setText(str(value))
         self.startingTimelist[panel_index][i].setStyleSheet("color: white")
         self.endingButtonlist[panel_index][i].setEnabled(True)
+        self.check_save_conditions(panel_index, i)
 
     def onendbuttonClicked(self, panel_index, i):
         value = self.getSliderValue()
+        error = self._check_event_times(panel_index, i, self.startingTimelist[panel_index][i].text(), value)
+        if error:
+            QMessageBox.warning(self, "End time not set", error)
+            return
         self.endingTimelist[panel_index][i].setText(str(value))
         self.endingTimelist[panel_index][i].setStyleSheet("color: white")
         if self.ratingButtonslist[panel_index] and len(self.ratingButtonslist[panel_index]) > i:
@@ -931,7 +1058,16 @@ class Window(QWidget):
             self.saveEntryBtn[panel_index][i].setEnabled(False)
         self.clearEntryBtn[panel_index][i].setEnabled(True)
 
+    def _has_save_directory(self):
+        """Entries are saved in a folder named after the video, so one must be open."""
+        if self.save_directory:
+            return True
+        QMessageBox.warning(self, "No video open", "Open a video before saving entries.")
+        return False
+
     def onsaveEntryBtnClicked(self, panel_index, i):
+        if not self._has_save_directory():
+            return
         self.saveEntryBtn[panel_index][i].setEnabled(False)
 
         form_title = self.form_title[panel_index].text()
@@ -977,9 +1113,13 @@ class Window(QWidget):
             self.timer.stop()
 
         if self.vidname:
-            frame_num = int(self.mediaPlayer.get_position() * (self.media.get_duration()))
+            frame_num = self._current_time_ms()
             self.cap.set(cv2.CAP_PROP_POS_MSEC, frame_num)
             (ret, self.frame) = self.cap.read()
+            if not ret:
+                # e.g. at the very end of the video, where there's no frame left to read
+                QMessageBox.warning(self, "Snapshot not saved", "Could not read the video frame at this time.")
+                return
             if self.image_save_directory:
                 self.image = self.image_save_directory + "/{}Frame{}.png".format(
                     str(self.vidname).split(".")[-2], str(frame_num)
@@ -990,8 +1130,17 @@ class Window(QWidget):
         self.ImagesBuffer = image
 
     def update_ui(self):
-        media_pos = int(self.mediaPlayer.get_position() * 100000)
-        self.slider.setValue(media_pos)
+        state = self.mediaPlayer.get_state()
+        if state in (vlc.State.Opening, vlc.State.Buffering):
+            return  # still starting up, don't mistake it for having stopped
+        # Read the time now: once the player is stopped VLC only reports -1
+        self._current_time_ms()
+        self.d.setText(self.getDurationValue())
+        media_pos = self.mediaPlayer.get_position()
+        # Leave the slider alone while the user holds it: setValue on a pressed
+        # slider emits sliderMoved, which would seek back to VLC's position
+        if media_pos >= 0 and not self.slider.isSliderDown():
+            self.slider.setValue(int(media_pos * 100000))
         if not self.mediaPlayer.is_playing():
             self.timer.stop()
             if not self.is_paused:
@@ -1012,7 +1161,7 @@ class Window(QWidget):
             self.mediaPlayer.set_rate(3)
 
     def save(self):
-        if self.num_panels != 0:
+        if self.num_panels != 0 and self._has_save_directory():
             for panel_index in range(1, self.num_panels + 1):
                 if self.startingButtonlist[panel_index]:
                     for i in range(len(self.startingButtonlist[panel_index])):
@@ -1055,6 +1204,8 @@ class Window(QWidget):
                 )
 
     def save_rating_entry(self, panel_index, i):
+        if not self._has_save_directory():
+            return
         form_title = self.form_title[panel_index].text()
         task_name = self.tasklist[panel_index][i].text()
         starting_time = self.startingTimelist[panel_index][i].text()
@@ -1096,11 +1247,9 @@ class Window(QWidget):
                 self.clearEntryBtn[panel_index] = None
                 self.ratingButtonslist[panel_index] = None
                 self.groupButtonlist[panel_index] = None
+                self.overlapCheckbox[panel_index] = None
 
             self.num_panels = 0
-
-    def close(self):
-        sys.exit(app.exec_())
 
 
 if __name__ == "__main__":
