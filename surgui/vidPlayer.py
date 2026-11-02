@@ -65,6 +65,175 @@ class Slider(QSlider):
         self.setValue(value)
 
 
+class AnnotationEditor(QDialog):
+    """Table for fixing the entries saved in a panel's output file.
+
+    Timestamp panels save to "<panel>.txt" as "task : (start , end)" and rating
+    panels to "<panel>_scores.txt" as "task : score | Time: start to end". The
+    dialog isn't modal, so the video can be played and paused while editing.
+    """
+
+    TIME_FORMAT = r"\d+:[0-5]\d:[0-5]\d"
+    TIMESTAMP_LINE = r"(.*) : \(([\d:]+) , ([\d:]+)\)$"
+    RATING_LINE = r"(.*?) : (.*?) \| Time: ([\d:]+) to ([\d:]+)$"
+
+    def __init__(self, player, path):
+        super().__init__(player)
+        self.player = player
+        self.path = path
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        self.setWindowTitle("Edit annotations: " + os.path.basename(path))
+        self.resize(650, 400)
+
+        with open(path) as f:
+            self.original_text = f.read()
+        self.is_rating = path.endswith("_scores.txt") or "| Time:" in self.original_text
+        self.columns = ["Task", "Score", "Start", "End"] if self.is_rating else ["Task", "Start", "End"]
+
+        self.table = QTableWidget(0, len(self.columns))
+        self.table.setHorizontalHeaderLabels(self.columns)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+
+        # Lines that aren't in the expected format are kept as they are when saving
+        self.unreadable = []
+        pattern = self.RATING_LINE if self.is_rating else self.TIMESTAMP_LINE
+        for line in self.original_text.splitlines():
+            m = re.match(pattern, line.strip())
+            if m:
+                row = self.table.rowCount()
+                self.table.insertRow(row)
+                for column, value in enumerate(m.groups()):
+                    self.table.setItem(row, column, QTableWidgetItem(value.strip()))
+            elif line.strip():
+                self.unreadable.append(line)
+
+        buttonLayout = QHBoxLayout()
+        for label, slot in [
+            ("Go to start", self.go_to_start),
+            ("Set start to now", partial(self.set_to_now, "Start")),
+            ("Set end to now", partial(self.set_to_now, "End")),
+            ("Delete entry", self.delete_entries),
+            (None, None),
+            ("Save", self.save),
+            ("Cancel", self.close),
+        ]:
+            if label is None:
+                buttonLayout.addStretch(1)
+                continue
+            btn = QPushButton(label)
+            btn.clicked.connect(slot)
+            buttonLayout.addWidget(btn)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.table)
+        layout.addLayout(buttonLayout)
+
+    def _current_row(self):
+        """Row the time buttons act on, or -1 (after a warning) without a row or a video."""
+        if self.player.media is None:
+            QMessageBox.warning(self, "No video open", "Open the video these annotations belong to first.")
+            return -1
+        if self.table.currentRow() < 0:
+            QMessageBox.warning(self, "No entry selected", "Click an entry in the table first.")
+        return self.table.currentRow()
+
+    def go_to_start(self):
+        row = self._current_row()
+        if row >= 0:
+            start = self.table.item(row, self.columns.index("Start")).text()
+            self.player.set_time_ms(self.player._time_to_seconds(start) * 1000)
+
+    def set_to_now(self, column):
+        row = self._current_row()
+        if row >= 0:
+            self.table.item(row, self.columns.index(column)).setText(self.player.getSliderValue())
+
+    def delete_entries(self):
+        for row in sorted({index.row() for index in self.table.selectedIndexes()}, reverse=True):
+            self.table.removeRow(row)
+
+    def _entry_error(self, entry):
+        if not entry["Task"]:
+            return "the task is empty."
+        if self.is_rating and not entry["Score"].isdigit():
+            return "the score must be a whole number."
+        for column in ("Start", "End"):
+            if not re.fullmatch(self.TIME_FORMAT, entry[column]):
+                return "{} time '{}' isn't in H:MM:SS format.".format(column.lower(), entry[column])
+        if self.player._time_to_seconds(entry["End"]) < self.player._time_to_seconds(entry["Start"]):
+            return "the end time is before the start time."
+        return None
+
+    def _overlap_error(self, entries):
+        """Why the entries overlap, if this file's panel is open with overlapping events turned off."""
+        w = self.player
+        title = os.path.splitext(os.path.basename(self.path))[0]
+        if self.is_rating:
+            title = title[: -len("_scores")]
+        if not any(
+            w.form_title[i] is not None
+            and w.form_title[i].text() == title
+            and bool(w.groupButtonlist[i]) == self.is_rating
+            and not w.overlapCheckbox[i].isChecked()
+            for i in range(1, w.num_panels + 1)
+        ):
+            return None
+
+        to_s = w._time_to_seconds
+        latest = None  # the entry that ends last so far
+        for entry in sorted(entries, key=lambda e: (to_s(e["Start"]), to_s(e["End"]))):
+            if latest and to_s(entry["Start"]) < to_s(latest["End"]):
+                return "'{}' ({} to {}) overlaps with '{}' ({} to {}).".format(
+                    entry["Task"], entry["Start"], entry["End"], latest["Task"], latest["Start"], latest["End"]
+                )
+            if not latest or to_s(entry["End"]) > to_s(latest["End"]):
+                latest = entry
+        return None
+
+    def save(self):
+        entries = []
+        for row in range(self.table.rowCount()):
+            entry = {column: self.table.item(row, c).text().strip() for c, column in enumerate(self.columns)}
+            error = self._entry_error(entry)
+            if error:
+                self.table.selectRow(row)
+                QMessageBox.warning(self, "Entry not valid", "Row {}: {}".format(row + 1, error))
+                return
+            entries.append(entry)
+        error = self._overlap_error(entries)
+        if error:
+            QMessageBox.warning(self, "Overlapping events", error)
+            return
+
+        current = None
+        if os.path.exists(self.path):
+            with open(self.path) as f:
+                current = f.read()
+        if current != self.original_text:
+            reply = QMessageBox.question(
+                self,
+                "File changed",
+                "This file changed after you opened it, for example from saving an entry in a panel. "
+                "Saving will replace those changes. Save anyway?",
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        with open(self.path, "w") as f:
+            for entry in entries:
+                if self.is_rating:
+                    f.write(
+                        "{} : {} | Time: {} to {}\n".format(entry["Task"], entry["Score"], entry["Start"], entry["End"])
+                    )
+                else:
+                    f.write("{} : ({} , {})\n".format(entry["Task"], entry["Start"], entry["End"]))
+            for line in self.unreadable:
+                f.write(line + "\n")
+        self.player._dedupe_and_sort_file(self.path)
+        self.close()
+
+
 class Window(QWidget):
     def __init__(self):
         super().__init__()
@@ -276,6 +445,11 @@ class Window(QWidget):
         saveEntriesAction.setShortcut("Ctrl+S")
         saveEntriesAction.triggered.connect(self.save)
 
+        editAnnotationsAction = QAction("&Edit Saved Annotations", self)
+        editAnnotationsAction.setStatusTip("Open a saved timestamp or rating file and edit its entries")
+        editAnnotationsAction.setShortcut("Ctrl+E")
+        editAnnotationsAction.triggered.connect(self.edit_annotations)
+
         clearPanelsAction = QAction("&Clear Panels", self)
         clearPanelsAction.setStatusTip("Clear all panels")
         clearPanelsAction.setShortcut("Ctrl+C")
@@ -301,6 +475,7 @@ class Window(QWidget):
         fileMenu.addAction(addRatingPanelFileAction)
         fileMenu.addAction(changeSaveDirectoryAction)
         fileMenu.addAction(saveEntriesAction)
+        fileMenu.addAction(editAnnotationsAction)
         fileMenu.addAction(clearPanelsAction)
         fileMenu.addAction(exitAction)
 
@@ -939,6 +1114,36 @@ class Window(QWidget):
         self.timer.stop()
         self.mediaPlayer.set_position(position / 100000)
         self.timer.start()
+
+    def set_time_ms(self, ms):
+        self.timer.stop()
+        self.mediaPlayer.set_time(int(ms))
+        self.timer.start()
+
+    def edit_annotations(self):
+        start_dir = self.save_directory or self.parrentDirectory or "./outputs"
+        filename, _ = QFileDialog.getOpenFileName(self, "Open Saved Annotations", start_dir, "Text files (*.txt)")
+        if filename == "":
+            return
+
+        editor = AnnotationEditor(self, filename)
+        if editor.table.rowCount() == 0 and editor.unreadable:
+            editor.deleteLater()
+            QMessageBox.warning(
+                self,
+                "Not an annotation file",
+                "No saved entries were found in this file. Pick a file from the outputs folder, "
+                "like <panel>.txt or <panel>_scores.txt.",
+            )
+            return
+        editor.show()
+        if editor.unreadable:
+            QMessageBox.information(
+                editor,
+                "Some lines not read",
+                "{} line(s) in this file aren't in the expected format. "
+                "They'll be kept as they are when you save.".format(len(editor.unreadable)),
+            )
 
     def handle_errors(self):
         self.playBtn.setEnabled(False)
