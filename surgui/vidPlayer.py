@@ -44,6 +44,10 @@ import json
 import time
 import re
 
+# Entries in a panel's output file
+TIMESTAMP_LINE = r"(.*) : \(([\d:]+) , ([\d:]+)\)$"  # <panel>.txt: "task : (start , end)"
+RATING_LINE = r"(.*?) : (.*?) \| Time: ([\d:]+) to ([\d:]+)$"  # <panel>_scores.txt: "task : score | Time: start to end"
+
 
 class Slider(QSlider):
     def mousePressEvent(self, event, window):
@@ -65,173 +69,19 @@ class Slider(QSlider):
         self.setValue(value)
 
 
-class AnnotationEditor(QDialog):
-    """Table for fixing the entries saved in a panel's output file.
+class TimeLabel(QLabel):
+    """Start or end time in a panel row. Clicking it jumps the video to that time."""
 
-    Timestamp panels save to "<panel>.txt" as "task : (start , end)" and rating
-    panels to "<panel>_scores.txt" as "task : score | Time: start to end". The
-    dialog isn't modal, so the video can be played and paused while editing.
-    """
+    clicked = pyqtSignal(str)
 
-    TIME_FORMAT = r"\d+:[0-5]\d:[0-5]\d"
-    TIMESTAMP_LINE = r"(.*) : \(([\d:]+) , ([\d:]+)\)$"
-    RATING_LINE = r"(.*?) : (.*?) \| Time: ([\d:]+) to ([\d:]+)$"
+    def __init__(self, text):
+        super().__init__(text)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip("Click to jump the video to this time")
 
-    def __init__(self, player, path):
-        super().__init__(player)
-        self.player = player
-        self.path = path
-        self.setAttribute(Qt.WA_DeleteOnClose)
-        self.setWindowTitle("Edit annotations: " + os.path.basename(path))
-        self.resize(650, 400)
-
-        with open(path) as f:
-            self.original_text = f.read()
-        self.is_rating = path.endswith("_scores.txt") or "| Time:" in self.original_text
-        self.columns = ["Task", "Score", "Start", "End"] if self.is_rating else ["Task", "Start", "End"]
-
-        self.table = QTableWidget(0, len(self.columns))
-        self.table.setHorizontalHeaderLabels(self.columns)
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-
-        # Lines that aren't in the expected format are kept as they are when saving
-        self.unreadable = []
-        pattern = self.RATING_LINE if self.is_rating else self.TIMESTAMP_LINE
-        for line in self.original_text.splitlines():
-            m = re.match(pattern, line.strip())
-            if m:
-                row = self.table.rowCount()
-                self.table.insertRow(row)
-                for column, value in enumerate(m.groups()):
-                    self.table.setItem(row, column, QTableWidgetItem(value.strip()))
-            elif line.strip():
-                self.unreadable.append(line)
-
-        buttonLayout = QHBoxLayout()
-        for label, slot in [
-            ("Go to start", self.go_to_start),
-            ("Set start to now", partial(self.set_to_now, "Start")),
-            ("Set end to now", partial(self.set_to_now, "End")),
-            ("Delete entry", self.delete_entries),
-            (None, None),
-            ("Save", self.save),
-            ("Cancel", self.close),
-        ]:
-            if label is None:
-                buttonLayout.addStretch(1)
-                continue
-            btn = QPushButton(label)
-            btn.clicked.connect(slot)
-            buttonLayout.addWidget(btn)
-
-        layout = QVBoxLayout(self)
-        layout.addWidget(self.table)
-        layout.addLayout(buttonLayout)
-
-    def _current_row(self):
-        """Row the time buttons act on, or -1 (after a warning) without a row or a video."""
-        if self.player.media is None:
-            QMessageBox.warning(self, "No video open", "Open the video these annotations belong to first.")
-            return -1
-        if self.table.currentRow() < 0:
-            QMessageBox.warning(self, "No entry selected", "Click an entry in the table first.")
-        return self.table.currentRow()
-
-    def go_to_start(self):
-        row = self._current_row()
-        if row >= 0:
-            start = self.table.item(row, self.columns.index("Start")).text()
-            self.player.set_time_ms(self.player._time_to_seconds(start) * 1000)
-
-    def set_to_now(self, column):
-        row = self._current_row()
-        if row >= 0:
-            self.table.item(row, self.columns.index(column)).setText(self.player.getSliderValue())
-
-    def delete_entries(self):
-        for row in sorted({index.row() for index in self.table.selectedIndexes()}, reverse=True):
-            self.table.removeRow(row)
-
-    def _entry_error(self, entry):
-        if not entry["Task"]:
-            return "the task is empty."
-        if self.is_rating and not entry["Score"].isdigit():
-            return "the score must be a whole number."
-        for column in ("Start", "End"):
-            if not re.fullmatch(self.TIME_FORMAT, entry[column]):
-                return "{} time '{}' isn't in H:MM:SS format.".format(column.lower(), entry[column])
-        if self.player._time_to_seconds(entry["End"]) < self.player._time_to_seconds(entry["Start"]):
-            return "the end time is before the start time."
-        return None
-
-    def _overlap_error(self, entries):
-        """Why the entries overlap, if this file's panel is open with overlapping events turned off."""
-        w = self.player
-        title = os.path.splitext(os.path.basename(self.path))[0]
-        if self.is_rating:
-            title = title[: -len("_scores")]
-        if not any(
-            w.form_title[i] is not None
-            and w.form_title[i].text() == title
-            and bool(w.groupButtonlist[i]) == self.is_rating
-            and not w.overlapCheckbox[i].isChecked()
-            for i in range(1, w.num_panels + 1)
-        ):
-            return None
-
-        to_s = w._time_to_seconds
-        latest = None  # the entry that ends last so far
-        for entry in sorted(entries, key=lambda e: (to_s(e["Start"]), to_s(e["End"]))):
-            if latest and to_s(entry["Start"]) < to_s(latest["End"]):
-                return "'{}' ({} to {}) overlaps with '{}' ({} to {}).".format(
-                    entry["Task"], entry["Start"], entry["End"], latest["Task"], latest["Start"], latest["End"]
-                )
-            if not latest or to_s(entry["End"]) > to_s(latest["End"]):
-                latest = entry
-        return None
-
-    def save(self):
-        entries = []
-        for row in range(self.table.rowCount()):
-            entry = {column: self.table.item(row, c).text().strip() for c, column in enumerate(self.columns)}
-            error = self._entry_error(entry)
-            if error:
-                self.table.selectRow(row)
-                QMessageBox.warning(self, "Entry not valid", "Row {}: {}".format(row + 1, error))
-                return
-            entries.append(entry)
-        error = self._overlap_error(entries)
-        if error:
-            QMessageBox.warning(self, "Overlapping events", error)
-            return
-
-        current = None
-        if os.path.exists(self.path):
-            with open(self.path) as f:
-                current = f.read()
-        if current != self.original_text:
-            reply = QMessageBox.question(
-                self,
-                "File changed",
-                "This file changed after you opened it, for example from saving an entry in a panel. "
-                "Saving will replace those changes. Save anyway?",
-            )
-            if reply != QMessageBox.Yes:
-                return
-
-        with open(self.path, "w") as f:
-            for entry in entries:
-                if self.is_rating:
-                    f.write(
-                        "{} : {} | Time: {} to {}\n".format(entry["Task"], entry["Score"], entry["Start"], entry["End"])
-                    )
-                else:
-                    f.write("{} : ({} , {})\n".format(entry["Task"], entry["Start"], entry["End"]))
-            for line in self.unreadable:
-                f.write(line + "\n")
-        self.player._dedupe_and_sort_file(self.path)
-        self.close()
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit(self.text())
 
 
 class Window(QWidget):
@@ -403,6 +253,9 @@ class Window(QWidget):
         self.ratingItemlist = [None] * 10
         self.groupButtonlist = [None] * 10
         self.overlapCheckbox = [None] * 10
+        # Panels opened from a saved annotation file: that file, and the line each row came from
+        self.editFile = [None] * 10
+        self.editLines = [None] * 10
 
         self.timer = QTimer(self)
         self.timer.setInterval(100)
@@ -445,10 +298,10 @@ class Window(QWidget):
         saveEntriesAction.setShortcut("Ctrl+S")
         saveEntriesAction.triggered.connect(self.save)
 
-        editAnnotationsAction = QAction("&Edit Saved Annotations", self)
-        editAnnotationsAction.setStatusTip("Open a saved timestamp or rating file and edit its entries")
-        editAnnotationsAction.setShortcut("Ctrl+E")
-        editAnnotationsAction.triggered.connect(self.edit_annotations)
+        openAnnotationsAction = QAction("&Open Saved Annotations", self)
+        openAnnotationsAction.setStatusTip("Open a saved timestamp or rating file as a panel to edit its entries")
+        openAnnotationsAction.setShortcut("Ctrl+E")
+        openAnnotationsAction.triggered.connect(self.open_annotations)
 
         clearPanelsAction = QAction("&Clear Panels", self)
         clearPanelsAction.setStatusTip("Clear all panels")
@@ -473,9 +326,9 @@ class Window(QWidget):
         fileMenu.addAction(openVideoAction)
         fileMenu.addAction(addTimePanelFileAction)
         fileMenu.addAction(addRatingPanelFileAction)
+        fileMenu.addAction(openAnnotationsAction)
         fileMenu.addAction(changeSaveDirectoryAction)
         fileMenu.addAction(saveEntriesAction)
-        fileMenu.addAction(editAnnotationsAction)
         fileMenu.addAction(clearPanelsAction)
         fileMenu.addAction(exitAction)
 
@@ -637,20 +490,42 @@ class Window(QWidget):
 
     def _saved_events(self, panel_index):
         """(task, start, end) of the entries already in the panel's output file."""
-        if not self.save_directory:
+        if not (self.save_directory or self.editFile[panel_index]):
             return []
-        title = self.form_title[panel_index].text()
-        if self.groupButtonlist[panel_index]:  # rating panel
-            path = "{}/{}_scores.txt".format(self.save_directory, title)
-            pattern = r"(.*?) : .*\| Time: ([\d:]+) to ([\d:]+)$"
-        else:
-            path = "{}/{}.txt".format(self.save_directory, title)
-            pattern = r"(.*) : \(([\d:]+) , ([\d:]+)\)$"
+        path = self._output_path(panel_index)
         if not os.path.exists(path):
             return []
+        pattern = RATING_LINE if self.ratingButtonslist[panel_index] is not None else TIMESTAMP_LINE
+        events = []
         with open(path) as f:
-            matches = [re.match(pattern, line.strip()) for line in f]
-        return [m.groups() for m in matches if m]
+            for line in f:
+                m = re.match(pattern, line.strip())
+                if m:
+                    events.append((m.groups()[0], m.groups()[-2], m.groups()[-1]))
+        return events
+
+    def _output_path(self, panel_index):
+        """File the panel saves to: the annotation file it was opened from, or one named after the panel."""
+        if self.editFile[panel_index]:
+            return self.editFile[panel_index]
+        suffix = "_scores.txt" if self.ratingButtonslist[panel_index] is not None else ".txt"
+        return "{}/{}{}".format(self.save_directory, self.form_title[panel_index].text(), suffix)
+
+    def _replace_saved_entry(self, panel_index, i, new_line):
+        """Swap row i's entry in its opened annotation file for new_line, or remove it if new_line is None."""
+        path = self.editFile[panel_index]
+        lines = []
+        if os.path.exists(path):
+            with open(path) as f:
+                lines = [line.strip() for line in f if line.strip()]
+        if self.editLines[panel_index][i] in lines:
+            lines.remove(self.editLines[panel_index][i])
+        if new_line is not None:
+            lines.append(new_line)
+        with open(path, "w") as f:
+            f.writelines(line + "\n" for line in lines)
+        self._dedupe_and_sort_file(path)
+        self.editLines[panel_index][i] = new_line
 
     # =========================================================================
     # Existing methods
@@ -822,97 +697,103 @@ class Window(QWidget):
                 lines = f.read().splitlines()
             print("Opened time panel:", title)
 
-            self.num_panels += 1
-            self.panel_index = self.num_panels
+            self._add_time_panel(title, lines)
 
-            self.tasklist[self.panel_index] = []
-            self.startingButtonlist[self.panel_index] = []
-            self.startingTimelist[self.panel_index] = []
-            self.endingButtonlist[self.panel_index] = []
-            self.endingTimelist[self.panel_index] = []
-            self.saveEntryBtn[self.panel_index] = []
-            self.clearEntryBtn[self.panel_index] = []
+    def _add_time_panel(self, title, lines):
+        """Add a timestamping panel with one row per line ("task#start tip#end tip")."""
+        self.num_panels += 1
+        self.panel_index = self.num_panels
 
-            self.groupbox[self.panel_index] = QGroupBox()
-            self.formLayout[self.panel_index] = QFormLayout()
+        self.tasklist[self.panel_index] = []
+        self.startingButtonlist[self.panel_index] = []
+        self.startingTimelist[self.panel_index] = []
+        self.endingButtonlist[self.panel_index] = []
+        self.endingTimelist[self.panel_index] = []
+        self.saveEntryBtn[self.panel_index] = []
+        self.clearEntryBtn[self.panel_index] = []
 
-            self.form_title[self.panel_index] = QLabel(title)
-            self.form_title[self.panel_index].setStyleSheet("color: white")
-            self.form_title[self.panel_index].setAlignment(Qt.AlignCenter)
-            self.form_title[self.panel_index].setFont(QFont("Times", 12, weight=QFont.Bold))
+        self.groupbox[self.panel_index] = QGroupBox()
+        self.formLayout[self.panel_index] = QFormLayout()
 
-            self.panelRemoveBtn[self.panel_index] = QPushButton("Exit")
-            self.panelRemoveBtn[self.panel_index].clicked.connect(
-                partial(self.onpanelRemoveBtnClicked, self.panel_index)
+        self.form_title[self.panel_index] = QLabel(title)
+        self.form_title[self.panel_index].setStyleSheet("color: white")
+        self.form_title[self.panel_index].setAlignment(Qt.AlignCenter)
+        self.form_title[self.panel_index].setFont(QFont("Times", 12, weight=QFont.Bold))
+
+        self.panelRemoveBtn[self.panel_index] = QPushButton("Exit")
+        self.panelRemoveBtn[self.panel_index].clicked.connect(
+            partial(self.onpanelRemoveBtnClicked, self.panel_index)
+        )
+
+        self.formLayout[self.panel_index].addRow(self.form_title[self.panel_index])
+        self._add_overlap_checkbox(self.panel_index)
+
+        for i, line in enumerate(lines):
+            line = line.split("#")
+
+            self.tasklist[self.panel_index].append(QLabel(line[0]))
+            self.tasklist[self.panel_index][i].setStyleSheet("background-color: black ; color: white")
+            self.tasklist[self.panel_index][i].setFont(QFont("Times", 10, weight=QFont.Bold))
+            self.tasklist[self.panel_index][i].setWordWrap(True)
+
+            self.startingButtonlist[self.panel_index].append(QPushButton("starts"))
+            self.startingButtonlist[self.panel_index][i].setFixedWidth(50)
+            self.startingTimelist[self.panel_index].append(TimeLabel("0"))
+            self.startingTimelist[self.panel_index][i].setStyleSheet("color: white")
+            self.startingTimelist[self.panel_index][i].clicked.connect(self.go_to_time)
+            self.startingButtonlist[self.panel_index][i].clicked.connect(
+                partial(self.onstartbuttonClicked, self.panel_index, i)
             )
 
-            self.formLayout[self.panel_index].addRow(self.form_title[self.panel_index])
-            self._add_overlap_checkbox(self.panel_index)
+            self.endingButtonlist[self.panel_index].append(QPushButton("ends"))
+            self.endingButtonlist[self.panel_index][i].setFixedWidth(50)
+            self.endingTimelist[self.panel_index].append(TimeLabel("0"))
+            self.endingTimelist[self.panel_index][i].setStyleSheet("color: white")
+            self.endingTimelist[self.panel_index][i].clicked.connect(self.go_to_time)
+            self.endingButtonlist[self.panel_index][i].clicked.connect(
+                partial(self.onendbuttonClicked, self.panel_index, i)
+            )
 
-            for i, line in enumerate(lines):
-                line = line.split("#")
+            if len(line) == 3:
+                self.startingButtonlist[self.panel_index][i].setToolTip(line[1])
+                self.endingButtonlist[self.panel_index][i].setToolTip(line[2])
 
-                self.tasklist[self.panel_index].append(QLabel(line[0]))
-                self.tasklist[self.panel_index][i].setStyleSheet("background-color: black ; color: white")
-                self.tasklist[self.panel_index][i].setFont(QFont("Times", 10, weight=QFont.Bold))
-                self.tasklist[self.panel_index][i].setWordWrap(True)
+            self.saveEntryBtn[self.panel_index].append(QPushButton("save"))
+            self.clearEntryBtn[self.panel_index].append(QPushButton("clear"))
+            self.saveEntryBtn[self.panel_index][i].setFixedWidth(50)
+            self.clearEntryBtn[self.panel_index][i].setFixedWidth(50)
+            self.saveEntryBtn[self.panel_index][i].setEnabled(False)
+            self.saveEntryBtn[self.panel_index][i].clicked.connect(
+                partial(self.onsaveEntryBtnClicked, self.panel_index, i)
+            )
+            self.clearEntryBtn[self.panel_index][i].setEnabled(False)
+            self.clearEntryBtn[self.panel_index][i].clicked.connect(
+                partial(self.onclearEntryBtnClicked, self.panel_index, i)
+            )
 
-                self.startingButtonlist[self.panel_index].append(QPushButton("starts"))
-                self.startingButtonlist[self.panel_index][i].setFixedWidth(50)
-                self.startingTimelist[self.panel_index].append(QLabel("0"))
-                self.startingTimelist[self.panel_index][i].setStyleSheet("color: white")
-                self.startingButtonlist[self.panel_index][i].clicked.connect(
-                    partial(self.onstartbuttonClicked, self.panel_index, i)
-                )
+            self.formLayout[self.panel_index].addRow(self.tasklist[self.panel_index][i])
+            self.formLayout[self.panel_index].addRow(
+                self.startingButtonlist[self.panel_index][i],
+                self.startingTimelist[self.panel_index][i],
+            )
+            self.formLayout[self.panel_index].addRow(
+                self.endingButtonlist[self.panel_index][i],
+                self.endingTimelist[self.panel_index][i],
+            )
+            self.formLayout[self.panel_index].addRow(
+                self.saveEntryBtn[self.panel_index][i],
+                self.clearEntryBtn[self.panel_index][i],
+            )
 
-                self.endingButtonlist[self.panel_index].append(QPushButton("ends"))
-                self.endingButtonlist[self.panel_index][i].setFixedWidth(50)
-                self.endingTimelist[self.panel_index].append(QLabel("0"))
-                self.endingTimelist[self.panel_index][i].setStyleSheet("color: white")
-                self.endingButtonlist[self.panel_index][i].clicked.connect(
-                    partial(self.onendbuttonClicked, self.panel_index, i)
-                )
+        self.groupbox[self.panel_index].setLayout(self.formLayout[self.panel_index])
+        self.scroll[self.panel_index] = QScrollArea()
+        self.scroll[self.panel_index].setWidget(self.groupbox[self.panel_index])
+        self.scroll[self.panel_index].setWidgetResizable(True)
+        self.scroll[self.panel_index].setFocusPolicy(Qt.StrongFocus)
 
-                if len(line) == 3:
-                    self.startingButtonlist[self.panel_index][i].setToolTip(line[1])
-                    self.endingButtonlist[self.panel_index][i].setToolTip(line[2])
+        self.panelsSplitter.addWidget(self.scroll[self.panel_index])
 
-                self.saveEntryBtn[self.panel_index].append(QPushButton("save"))
-                self.clearEntryBtn[self.panel_index].append(QPushButton("clear"))
-                self.saveEntryBtn[self.panel_index][i].setFixedWidth(50)
-                self.clearEntryBtn[self.panel_index][i].setFixedWidth(50)
-                self.saveEntryBtn[self.panel_index][i].setEnabled(False)
-                self.saveEntryBtn[self.panel_index][i].clicked.connect(
-                    partial(self.onsaveEntryBtnClicked, self.panel_index, i)
-                )
-                self.clearEntryBtn[self.panel_index][i].setEnabled(False)
-                self.clearEntryBtn[self.panel_index][i].clicked.connect(
-                    partial(self.onclearEntryBtnClicked, self.panel_index, i)
-                )
-
-                self.formLayout[self.panel_index].addRow(self.tasklist[self.panel_index][i])
-                self.formLayout[self.panel_index].addRow(
-                    self.startingButtonlist[self.panel_index][i],
-                    self.startingTimelist[self.panel_index][i],
-                )
-                self.formLayout[self.panel_index].addRow(
-                    self.endingButtonlist[self.panel_index][i],
-                    self.endingTimelist[self.panel_index][i],
-                )
-                self.formLayout[self.panel_index].addRow(
-                    self.saveEntryBtn[self.panel_index][i],
-                    self.clearEntryBtn[self.panel_index][i],
-                )
-
-            self.groupbox[self.panel_index].setLayout(self.formLayout[self.panel_index])
-            self.scroll[self.panel_index] = QScrollArea()
-            self.scroll[self.panel_index].setWidget(self.groupbox[self.panel_index])
-            self.scroll[self.panel_index].setWidgetResizable(True)
-            self.scroll[self.panel_index].setFocusPolicy(Qt.StrongFocus)
-
-            self.panelsSplitter.addWidget(self.scroll[self.panel_index])
-
-            self.apply_panel_font_size_from_text()
+        self.apply_panel_font_size_from_text()
 
     def add_rating_panel_from_file(self):
         filename, _ = QFileDialog.getOpenFileName(self, "Open Text", filter="Text files (*.txt)")
@@ -924,134 +805,7 @@ class Window(QWidget):
                 lines = f.read().splitlines()
             print("Opened rating panel:", title)
 
-            self.num_panels += 1
-            self.panel_index = self.num_panels
-
-            self.tasklist[self.panel_index] = []
-            self.yesButtonlist[self.panel_index] = []
-            self.noButtonlist[self.panel_index] = []
-            self.ratingButtonslist[self.panel_index] = []
-            self.startingButtonlist[self.panel_index] = []
-            self.startingTimelist[self.panel_index] = []
-            self.endingButtonlist[self.panel_index] = []
-            self.endingTimelist[self.panel_index] = []
-            self.groupButtonlist[self.panel_index] = []
-            self.saveEntryBtn[self.panel_index] = []
-            self.clearEntryBtn[self.panel_index] = []
-
-            self.yes_label = QLabel("Yes")
-            self.yes_label.setStyleSheet("color: white")
-            self.no_label = QLabel("No")
-            self.no_label.setStyleSheet("color: white")
-
-            self.groupbox[self.panel_index] = QGroupBox()
-            self.formLayout[self.panel_index] = QFormLayout()
-            self.formLayout[self.panel_index].setVerticalSpacing(10)
-
-            self.form_title[self.panel_index] = QLabel(title)
-            self.form_title[self.panel_index].setStyleSheet("color: white")
-            self.form_title[self.panel_index].setAlignment(Qt.AlignCenter)
-            self.form_title[self.panel_index].setFont(QFont("Times", 12, weight=QFont.Bold))
-
-            self.panelRemoveBtn[self.panel_index] = QPushButton("Exit")
-            self.panelRemoveBtn[self.panel_index].clicked.connect(
-                partial(self.onpanelRemoveBtnClicked, self.panel_index)
-            )
-
-            self.formLayout[self.panel_index].addRow(self.form_title[self.panel_index])
-            self._add_overlap_checkbox(self.panel_index)
-
-            for i, line in enumerate(lines):
-                parts = line.strip().split(" : ")
-                task = parts[0]
-
-                num_scores = 5
-                if len(parts) > 1:
-                    try:
-                        num_scores = int(parts[1]) + 1
-                    except ValueError:
-                        print(
-                            "Warning: Invalid number of scores provided in line",
-                            i + 1,
-                            "using default value of 5.",
-                        )
-
-                self.tasklist[self.panel_index].append(QLabel(task))
-                self.tasklist[self.panel_index][i].setStyleSheet("background-color: black ; color: white")
-                self.tasklist[self.panel_index][i].setFont(QFont("Times", 10, weight=QFont.Bold))
-                self.tasklist[self.panel_index][i].setWordWrap(True)
-                self.tasklist[self.panel_index][i].setFixedWidth(100)
-
-                self.startingButtonlist[self.panel_index].append(QPushButton("starts"))
-                self.startingButtonlist[self.panel_index][i].setFixedWidth(50)
-                self.startingTimelist[self.panel_index].append(QLabel("0"))
-                self.startingTimelist[self.panel_index][i].setStyleSheet("color: white")
-                self.startingButtonlist[self.panel_index][i].clicked.connect(
-                    partial(self.onstartbuttonClicked, self.panel_index, i)
-                )
-
-                self.endingButtonlist[self.panel_index].append(QPushButton("ends"))
-                self.endingButtonlist[self.panel_index][i].setFixedWidth(50)
-                self.endingTimelist[self.panel_index].append(QLabel("0"))
-                self.endingTimelist[self.panel_index][i].setStyleSheet("color: white")
-                self.endingButtonlist[self.panel_index][i].clicked.connect(
-                    partial(self.onendbuttonClicked, self.panel_index, i)
-                )
-                self.endingButtonlist[self.panel_index][i].setEnabled(False)
-
-                self.ratingButtonslist[self.panel_index].append([])
-
-                for j in range(num_scores):
-                    self.ratingButtonslist[self.panel_index][i].append(QRadioButton(str(j + 1)))
-                    self.ratingButtonslist[self.panel_index][i][j].setStyleSheet(
-                        "background-color: black ; color: white"
-                    )
-                for btn in self.ratingButtonslist[self.panel_index][i]:
-                    btn.setEnabled(False)
-
-                self.groupButtonlist[self.panel_index].append(QButtonGroup())
-                for j in range(num_scores):
-                    self.groupButtonlist[self.panel_index][i].addButton(
-                        self.ratingButtonslist[self.panel_index][i][j]
-                    )
-                self.groupButtonlist[self.panel_index][i].buttonClicked.connect(
-                    partial(self.save_rating_entry, self.panel_index, i)
-                )
-
-                hbLayout = QHBoxLayout()
-                for j in range(num_scores):
-                    hbLayout.addWidget(self.ratingButtonslist[self.panel_index][i][j])
-                hbLayout.setContentsMargins(0, 0, 0, 0)
-                container = QWidget()
-                container.setLayout(hbLayout)
-
-                self.clearEntryBtn[self.panel_index].append(QPushButton("clear"))
-                self.clearEntryBtn[self.panel_index][i].setFixedWidth(50)
-                self.clearEntryBtn[self.panel_index][i].setEnabled(True)
-                self.clearEntryBtn[self.panel_index][i].clicked.connect(
-                    partial(self.onclearEntryBtnClicked, self.panel_index, i)
-                )
-
-                self.formLayout[self.panel_index].addRow(self.tasklist[self.panel_index][i], container)
-                self.formLayout[self.panel_index].addRow(
-                    self.startingButtonlist[self.panel_index][i],
-                    self.startingTimelist[self.panel_index][i],
-                )
-                self.formLayout[self.panel_index].addRow(
-                    self.endingButtonlist[self.panel_index][i],
-                    self.endingTimelist[self.panel_index][i],
-                )
-                self.formLayout[self.panel_index].addRow(self.clearEntryBtn[self.panel_index][i])
-
-            self.groupbox[self.panel_index].setLayout(self.formLayout[self.panel_index])
-            self.scroll[self.panel_index] = QScrollArea()
-            self.scroll[self.panel_index].setWidget(self.groupbox[self.panel_index])
-            self.scroll[self.panel_index].setWidgetResizable(True)
-            self.scroll[self.panel_index].setFocusPolicy(Qt.StrongFocus)
-
-            self.panelsSplitter.addWidget(self.scroll[self.panel_index])
-
-            self.apply_panel_font_size_from_text()
+            self._add_rating_panel(title, lines)
 
             if self.save_directory:
                 scores_path = self.save_directory + "/" + self.form_title[self.panel_index].text() + "_scores.txt"
@@ -1098,6 +852,139 @@ class Window(QWidget):
                     # NEW: clean up after initial write
                     self._dedupe_and_sort_file(scores_path)
 
+    def _add_rating_panel(self, title, lines):
+        """Add a rating panel with one row per line ("task : number of scores")."""
+        self.num_panels += 1
+        self.panel_index = self.num_panels
+
+        self.tasklist[self.panel_index] = []
+        self.yesButtonlist[self.panel_index] = []
+        self.noButtonlist[self.panel_index] = []
+        self.ratingButtonslist[self.panel_index] = []
+        self.startingButtonlist[self.panel_index] = []
+        self.startingTimelist[self.panel_index] = []
+        self.endingButtonlist[self.panel_index] = []
+        self.endingTimelist[self.panel_index] = []
+        self.groupButtonlist[self.panel_index] = []
+        self.saveEntryBtn[self.panel_index] = []
+        self.clearEntryBtn[self.panel_index] = []
+
+        self.yes_label = QLabel("Yes")
+        self.yes_label.setStyleSheet("color: white")
+        self.no_label = QLabel("No")
+        self.no_label.setStyleSheet("color: white")
+
+        self.groupbox[self.panel_index] = QGroupBox()
+        self.formLayout[self.panel_index] = QFormLayout()
+        self.formLayout[self.panel_index].setVerticalSpacing(10)
+
+        self.form_title[self.panel_index] = QLabel(title)
+        self.form_title[self.panel_index].setStyleSheet("color: white")
+        self.form_title[self.panel_index].setAlignment(Qt.AlignCenter)
+        self.form_title[self.panel_index].setFont(QFont("Times", 12, weight=QFont.Bold))
+
+        self.panelRemoveBtn[self.panel_index] = QPushButton("Exit")
+        self.panelRemoveBtn[self.panel_index].clicked.connect(
+            partial(self.onpanelRemoveBtnClicked, self.panel_index)
+        )
+
+        self.formLayout[self.panel_index].addRow(self.form_title[self.panel_index])
+        self._add_overlap_checkbox(self.panel_index)
+
+        for i, line in enumerate(lines):
+            parts = line.strip().split(" : ")
+            task = parts[0]
+
+            num_scores = 5
+            if len(parts) > 1:
+                try:
+                    num_scores = int(parts[1]) + 1
+                except ValueError:
+                    print(
+                        "Warning: Invalid number of scores provided in line",
+                        i + 1,
+                        "using default value of 5.",
+                    )
+
+            self.tasklist[self.panel_index].append(QLabel(task))
+            self.tasklist[self.panel_index][i].setStyleSheet("background-color: black ; color: white")
+            self.tasklist[self.panel_index][i].setFont(QFont("Times", 10, weight=QFont.Bold))
+            self.tasklist[self.panel_index][i].setWordWrap(True)
+            self.tasklist[self.panel_index][i].setFixedWidth(100)
+
+            self.startingButtonlist[self.panel_index].append(QPushButton("starts"))
+            self.startingButtonlist[self.panel_index][i].setFixedWidth(50)
+            self.startingTimelist[self.panel_index].append(TimeLabel("0"))
+            self.startingTimelist[self.panel_index][i].setStyleSheet("color: white")
+            self.startingTimelist[self.panel_index][i].clicked.connect(self.go_to_time)
+            self.startingButtonlist[self.panel_index][i].clicked.connect(
+                partial(self.onstartbuttonClicked, self.panel_index, i)
+            )
+
+            self.endingButtonlist[self.panel_index].append(QPushButton("ends"))
+            self.endingButtonlist[self.panel_index][i].setFixedWidth(50)
+            self.endingTimelist[self.panel_index].append(TimeLabel("0"))
+            self.endingTimelist[self.panel_index][i].setStyleSheet("color: white")
+            self.endingTimelist[self.panel_index][i].clicked.connect(self.go_to_time)
+            self.endingButtonlist[self.panel_index][i].clicked.connect(
+                partial(self.onendbuttonClicked, self.panel_index, i)
+            )
+            self.endingButtonlist[self.panel_index][i].setEnabled(False)
+
+            self.ratingButtonslist[self.panel_index].append([])
+
+            for j in range(num_scores):
+                self.ratingButtonslist[self.panel_index][i].append(QRadioButton(str(j + 1)))
+                self.ratingButtonslist[self.panel_index][i][j].setStyleSheet(
+                    "background-color: black ; color: white"
+                )
+            for btn in self.ratingButtonslist[self.panel_index][i]:
+                btn.setEnabled(False)
+
+            self.groupButtonlist[self.panel_index].append(QButtonGroup())
+            for j in range(num_scores):
+                self.groupButtonlist[self.panel_index][i].addButton(
+                    self.ratingButtonslist[self.panel_index][i][j]
+                )
+            self.groupButtonlist[self.panel_index][i].buttonClicked.connect(
+                partial(self.save_rating_entry, self.panel_index, i)
+            )
+
+            hbLayout = QHBoxLayout()
+            for j in range(num_scores):
+                hbLayout.addWidget(self.ratingButtonslist[self.panel_index][i][j])
+            hbLayout.setContentsMargins(0, 0, 0, 0)
+            container = QWidget()
+            container.setLayout(hbLayout)
+
+            self.clearEntryBtn[self.panel_index].append(QPushButton("clear"))
+            self.clearEntryBtn[self.panel_index][i].setFixedWidth(50)
+            self.clearEntryBtn[self.panel_index][i].setEnabled(True)
+            self.clearEntryBtn[self.panel_index][i].clicked.connect(
+                partial(self.onclearEntryBtnClicked, self.panel_index, i)
+            )
+
+            self.formLayout[self.panel_index].addRow(self.tasklist[self.panel_index][i], container)
+            self.formLayout[self.panel_index].addRow(
+                self.startingButtonlist[self.panel_index][i],
+                self.startingTimelist[self.panel_index][i],
+            )
+            self.formLayout[self.panel_index].addRow(
+                self.endingButtonlist[self.panel_index][i],
+                self.endingTimelist[self.panel_index][i],
+            )
+            self.formLayout[self.panel_index].addRow(self.clearEntryBtn[self.panel_index][i])
+
+        self.groupbox[self.panel_index].setLayout(self.formLayout[self.panel_index])
+        self.scroll[self.panel_index] = QScrollArea()
+        self.scroll[self.panel_index].setWidget(self.groupbox[self.panel_index])
+        self.scroll[self.panel_index].setWidgetResizable(True)
+        self.scroll[self.panel_index].setFocusPolicy(Qt.StrongFocus)
+
+        self.panelsSplitter.addWidget(self.scroll[self.panel_index])
+
+        self.apply_panel_font_size_from_text()
+
     def position_changed(self):
         self.timer.stop()
         pos = self.slider.value()
@@ -1120,15 +1007,31 @@ class Window(QWidget):
         self.mediaPlayer.set_time(int(ms))
         self.timer.start()
 
-    def edit_annotations(self):
+    def go_to_time(self, time_text):
+        """Jump the video to a time shown in a panel row (its time label was clicked)."""
+        if self.media is not None and time_text != "0":
+            self.set_time_ms(self._time_to_seconds(time_text) * 1000)
+
+    def open_annotations(self):
+        """Open a saved timestamp or rating file as a panel with one row per entry.
+
+        Saving a row (or picking a score, in a rating file) replaces that entry
+        in the file, and clearing a row removes it.
+        """
         start_dir = self.save_directory or self.parrentDirectory or "./outputs"
         filename, _ = QFileDialog.getOpenFileName(self, "Open Saved Annotations", start_dir, "Text files (*.txt)")
         if filename == "":
             return
 
-        editor = AnnotationEditor(self, filename)
-        if editor.table.rowCount() == 0 and editor.unreadable:
-            editor.deleteLater()
+        with open(filename) as f:
+            lines = [line.strip() for line in f if line.strip()]
+        is_rating = filename.endswith("_scores.txt") or any("| Time:" in line for line in lines)
+        entries = []  # (line, its fields)
+        for line in lines:
+            m = re.match(RATING_LINE if is_rating else TIMESTAMP_LINE, line)
+            if m:
+                entries.append((line, m.groups()))
+        if not entries:
             QMessageBox.warning(
                 self,
                 "Not an annotation file",
@@ -1136,13 +1039,35 @@ class Window(QWidget):
                 "like <panel>.txt or <panel>_scores.txt.",
             )
             return
-        editor.show()
-        if editor.unreadable:
+
+        title = "Editing " + os.path.basename(filename)
+        if is_rating:
+            # The rating scale isn't saved with the scores: show 1-5, or up to the highest score used
+            top = max([5] + [int(fields[1]) for _, fields in entries if fields[1].isdigit()])
+            self._add_rating_panel(title, ["{} : {}".format(fields[0], top - 1) for _, fields in entries])
+        else:
+            self._add_time_panel(title, [fields[0] for _, fields in entries])
+
+        p = self.panel_index
+        self.editFile[p] = filename
+        self.editLines[p] = [line for line, _ in entries]
+        for i, (_, fields) in enumerate(entries):
+            self.startingTimelist[p][i].setText(fields[-2])
+            self.endingTimelist[p][i].setText(fields[-1])
+            self.endingButtonlist[p][i].setEnabled(True)
+            self.clearEntryBtn[p][i].setEnabled(True)
+            if is_rating:
+                for btn in self.ratingButtonslist[p][i]:
+                    btn.setEnabled(True)
+                    if btn.text() == fields[1]:
+                        btn.setChecked(True)
+
+        if len(entries) < len(lines):
             QMessageBox.information(
-                editor,
-                "Some lines not read",
+                self,
+                "Some lines not loaded",
                 "{} line(s) in this file aren't in the expected format. "
-                "They'll be kept as they are when you save.".format(len(editor.unreadable)),
+                "They're left in the file as they are.".format(len(lines) - len(entries)),
             )
 
     def handle_errors(self):
@@ -1200,6 +1125,7 @@ class Window(QWidget):
         self.startingTimelist[panel_index][i].setStyleSheet("color: white")
         self.endingButtonlist[panel_index][i].setEnabled(True)
         self.check_save_conditions(panel_index, i)
+        self._save_rating_times_if_editing(panel_index, i)
 
     def onendbuttonClicked(self, panel_index, i):
         value = self.getSliderValue()
@@ -1213,6 +1139,7 @@ class Window(QWidget):
             for btn in self.ratingButtonslist[panel_index][i]:
                 btn.setEnabled(True)
         self.check_save_conditions(panel_index, i)
+        self._save_rating_times_if_editing(panel_index, i)
 
     def onRatingSelected(self, panel_index, i):
         self.check_save_conditions(panel_index, i)
@@ -1263,33 +1190,49 @@ class Window(QWidget):
             self.saveEntryBtn[panel_index][i].setEnabled(False)
         self.clearEntryBtn[panel_index][i].setEnabled(True)
 
-    def _has_save_directory(self):
-        """Entries are saved in a folder named after the video, so one must be open."""
-        if self.save_directory:
+    def _has_save_directory(self, panel_index):
+        """Entries are saved in a folder named after the video, so one must be open.
+        Panels opened from a saved annotation file save back to that file instead."""
+        if self.save_directory or self.editFile[panel_index]:
             return True
         QMessageBox.warning(self, "No video open", "Open a video before saving entries.")
         return False
 
     def onsaveEntryBtnClicked(self, panel_index, i):
-        if not self._has_save_directory():
+        if not self._has_save_directory(panel_index):
             return
         self.saveEntryBtn[panel_index][i].setEnabled(False)
 
-        form_title = self.form_title[panel_index].text()
         task_name = self.tasklist[panel_index][i].text()
         starting_time = self.startingTimelist[panel_index][i].text()
         ending_time = self.endingTimelist[panel_index][i].text()
+        line = "{} : ({} , {})".format(task_name, starting_time, ending_time)
 
-        filepath = "{}/{}.txt".format(self.save_directory, form_title)
-        with open(filepath, "a") as f:
-            f.write("{} : ({} , {})\n".format(task_name, starting_time, ending_time))
+        if self.editFile[panel_index]:
+            self._replace_saved_entry(panel_index, i, line)
+        else:
+            filepath = self._output_path(panel_index)
+            with open(filepath, "a") as f:
+                f.write(line + "\n")
 
-        # NEW: dedupe + chronological sort after each save
-        self._dedupe_and_sort_file(filepath)
+            # NEW: dedupe + chronological sort after each save
+            self._dedupe_and_sort_file(filepath)
 
         self.clearEntryBtn[panel_index][i].setEnabled(True)
 
     def onclearEntryBtnClicked(self, panel_index, i):
+        if self.editFile[panel_index] and self.editLines[panel_index][i]:
+            reply = QMessageBox.question(
+                self,
+                "Remove entry",
+                "Remove this entry from {}?\n\n{}\n\nYou can mark and save it again afterwards.".format(
+                    os.path.basename(self.editFile[panel_index]), self.editLines[panel_index][i]
+                ),
+            )
+            if reply != QMessageBox.Yes:
+                return
+            self._replace_saved_entry(panel_index, i, None)
+
         self.startingTimelist[panel_index][i].setText("0")
         self.endingTimelist[panel_index][i].setText("0")
 
@@ -1366,12 +1309,13 @@ class Window(QWidget):
             self.mediaPlayer.set_rate(3)
 
     def save(self):
-        if self.num_panels != 0 and self._has_save_directory():
-            for panel_index in range(1, self.num_panels + 1):
-                if self.startingButtonlist[panel_index]:
-                    for i in range(len(self.startingButtonlist[panel_index])):
-                        if self.saveEntryBtn[panel_index][i] and self.saveEntryBtn[panel_index][i].isEnabled():
-                            self.onsaveEntryBtnClicked(panel_index, i)
+        for panel_index in range(1, self.num_panels + 1):
+            # Rating panels have no save buttons: their entries are saved when a score is picked
+            for i, btn in enumerate(self.saveEntryBtn[panel_index] or []):
+                if btn.isEnabled():
+                    if not self._has_save_directory(panel_index):
+                        return
+                    self.onsaveEntryBtnClicked(panel_index, i)
 
     def annotate(self):
         if self.image_save_directory:
@@ -1409,9 +1353,8 @@ class Window(QWidget):
                 )
 
     def save_rating_entry(self, panel_index, i):
-        if not self._has_save_directory():
+        if not self._has_save_directory(panel_index):
             return
-        form_title = self.form_title[panel_index].text()
         task_name = self.tasklist[panel_index][i].text()
         starting_time = self.startingTimelist[panel_index][i].text()
         ending_time = self.endingTimelist[panel_index][i].text()
@@ -1420,16 +1363,28 @@ class Window(QWidget):
         for j in range(len(self.ratingButtonslist[panel_index][i])):
             if self.ratingButtonslist[panel_index][i][j].isChecked():
                 score = self.ratingButtonslist[panel_index][i][j].text()
+        line = "{} : {} | Time: {} to {}".format(task_name, score, starting_time, ending_time)
 
-        filepath = "{}/{}_scores.txt".format(self.save_directory, form_title)
-        with open(filepath, "a") as f:
-            f.write("{} : {} | Time: {} to {}\n".format(task_name, score, starting_time, ending_time))
+        if self.editFile[panel_index]:
+            self._replace_saved_entry(panel_index, i, line)
+        else:
+            filepath = self._output_path(panel_index)
+            with open(filepath, "a") as f:
+                f.write(line + "\n")
 
-        # NEW: dedupe + chronological sort after each rating save
-        self._dedupe_and_sort_file(filepath)
+            # NEW: dedupe + chronological sort after each rating save
+            self._dedupe_and_sort_file(filepath)
 
         if self.saveEntryBtn[panel_index] and len(self.saveEntryBtn[panel_index]) > i:
             self.saveEntryBtn[panel_index][i].setEnabled(False)
+
+    def _save_rating_times_if_editing(self, panel_index, i):
+        """Rating rows have no save button, so in an opened annotation file a re-marked time is saved right away."""
+        if self.editFile[panel_index] and self.ratingButtonslist[panel_index] is not None:
+            start = self.startingTimelist[panel_index][i].text()
+            end = self.endingTimelist[panel_index][i].text()
+            if start != "0" and end != "0" and any(btn.isChecked() for btn in self.ratingButtonslist[panel_index][i]):
+                self.save_rating_entry(panel_index, i)
 
     def clearPanels(self):
         if self.num_panels != 0:
@@ -1453,6 +1408,8 @@ class Window(QWidget):
                 self.ratingButtonslist[panel_index] = None
                 self.groupButtonlist[panel_index] = None
                 self.overlapCheckbox[panel_index] = None
+                self.editFile[panel_index] = None
+                self.editLines[panel_index] = None
 
             self.num_panels = 0
 
