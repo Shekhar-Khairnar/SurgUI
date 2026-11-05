@@ -43,10 +43,31 @@ import subprocess
 import json
 import time
 import re
+import shutil
 
 # Entries in a panel's output file
 TIMESTAMP_LINE = r"(.*) : \(([\d:]+) , ([\d:]+)\)$"  # <panel>.txt: "task : (start , end)"
 RATING_LINE = r"(.*?) : (.*?) \| Time: ([\d:]+) to ([\d:]+)$"  # <panel>_scores.txt: "task : score | Time: start to end"
+
+# VLC settings that make decoding lighter for videos that lag or skip, at some cost to the picture
+PERFORMANCE_OPTIONS = (
+    "--avcodec-skiploopfilter=4",  # skip the H.264 loop filter (slightly blockier picture)
+    "--avcodec-skip-frame=1",  # don't decode frames nothing else depends on (choppier motion)
+    "--avcodec-fast",  # allow the decoder's speed tricks
+    "--file-caching=3000",  # read further ahead, for slow disks (ms)
+)
+
+# FFmpeg settings for the lighter copy of a video: at most 720p and 30 fps, easy to decode, a keyframe
+# every second for smoother seeking, no audio (the player has none). -copyts keeps the original's
+# timing, so times marked on the copy match the original even if its first frame doesn't start at 0.
+LIGHTER_COPY_ARGS = [
+    "-copyts", "-map", "0:v:0", "-an", "-sn", "-dn",
+    "-vf", "scale=-2:'min(720,ih)',fps=30",
+    "-c:v", "libx264", "-preset", "veryfast", "-tune", "fastdecode", "-crf", "26", "-g", "30",
+    "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+]  # fmt: skip
+LIGHTER_COPY_BYTES_PER_SEC = 400000  # rough size of the copy, for the disk space check
+LIGHTER_COPY_MAX_LENGTH_DIFF_MS = 500  # a copy further off than this from the original is rejected
 
 
 class Slider(QSlider):
@@ -158,6 +179,11 @@ class Window(QWidget):
         self.media = None
         self.mediaPlayer = self.instance.media_player_new()
         self._last_time_ms = 0
+        self.original_path = None  # the video that was opened
+        self.video_path = None  # what's playing: the original or its lighter copy
+        self._restarting = False  # the player was restarted and hasn't reported its real time yet
+        self._pause_after_restart = False
+        self.copyProcess = None  # FFmpeg, while it's making a lighter copy
 
         # In this widget, the video will be drawn
         if platform.system() == "Darwin":  # for MacOS
@@ -246,6 +272,33 @@ class Window(QWidget):
         self.orientationBtn.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
         self.orientationBtn.clicked.connect(self.toggle_panel_orientation)
         bottomLayout.addWidget(self.orientationBtn)
+
+        self.performanceCheck = QCheckBox("Performance mode")
+        self.performanceCheck.setStyleSheet("color: white")
+        self.performanceCheck.setToolTip(
+            "For videos that lag or skip: lowers the picture quality while playing to reduce the load.\n"
+            "The video file and snapshots aren't affected."
+        )
+        self.performanceCheck.setFocusPolicy(Qt.NoFocus)  # so Space keeps controlling play/pause
+        self.performanceCheck.toggled.connect(self.toggle_performance_mode)
+        bottomLayout.addWidget(self.performanceCheck)
+
+        self.lighterCopyBtn = QPushButton("Make lighter copy")
+        self.lighterCopyBtn.setToolTip(
+            "For videos that still lag or skip: makes a smaller copy (720p, 30 fps) to play instead.\n"
+            "The original isn't changed, annotations stay in the same folder, and snapshots still come from the original."
+        )
+        self.lighterCopyBtn.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+        self.lighterCopyBtn.setFocusPolicy(Qt.NoFocus)  # so Space keeps controlling play/pause
+        self.lighterCopyBtn.setEnabled(False)
+        self.lighterCopyBtn.clicked.connect(self.on_lighter_copy_clicked)
+        bottomLayout.addWidget(self.lighterCopyBtn)
+
+        self.copyProgress = QProgressBar()
+        self.copyProgress.setFixedWidth(120)
+        self.copyProgress.setStyleSheet("color: white")
+        self.copyProgress.hide()
+        bottomLayout.addWidget(self.copyProgress)
 
         bottomLayout.addStretch(1)
 
@@ -616,6 +669,9 @@ class Window(QWidget):
             super().keyPressEvent(event)
 
     def open_video(self):
+        if self.copyProcess is not None and not self._cancel_lighter_copy():
+            return
+
         filename, _ = QFileDialog.getOpenFileName(
             self,
             "Open Video",
@@ -627,26 +683,6 @@ class Window(QWidget):
         )
 
         if filename != "":
-            self.media = self.instance.media_new(filename)
-            self.mediaPlayer.set_media(self.media)
-            self.media.parse()
-            self._last_time_ms = 0
-            self.setWindowTitle(self.media.get_meta(0))
-
-            self.playBtn.setEnabled(True)
-
-            if platform.system() == "Windows":
-                self.mediaPlayer.set_hwnd(int(self.videowidget.winId()))
-            elif platform.system() == "Darwin":
-                self.mediaPlayer.set_nsobject(int(self.videowidget.winId()))
-            else:
-                print("Unsupported platform")
-
-            self.cap = cv2.VideoCapture(filename)
-            self.play_video()
-
-            self.d.setText(str(self.getDurationValue()))
-
             if not self.parrentDirectory:
                 self.parrentDirectory = "./outputs"
                 if not os.path.exists(self.parrentDirectory):
@@ -661,6 +697,23 @@ class Window(QWidget):
             if not os.path.exists(self.parrentDirectory + "/" + self.vidname + "/images"):
                 os.mkdir(self.parrentDirectory + "/" + self.vidname + "/images")
             self.image_save_directory = self.parrentDirectory + "/" + self.vidname + "/images"
+
+            # A lighter copy made earlier is played instead, and it can be switched off with the button
+            self.original_path = filename
+            self.video_path = self._lighter_copy_path() if os.path.exists(self._lighter_copy_path()) else filename
+            self._set_media()
+            self._last_time_ms = 0
+            self._update_video_title()
+
+            self.playBtn.setEnabled(True)
+
+            self._attach_video_output()
+
+            self.cap = cv2.VideoCapture(filename)  # snapshots always come from the original
+            self.play_video()
+
+            self.d.setText(str(self.getDurationValue()))
+            self._update_lighter_copy_button()
 
             if self.num_panels > 0:
                 self.clearPanels()
@@ -695,7 +748,230 @@ class Window(QWidget):
                                                     if int(self.ratingButtonslist[panel_index][i][j].text()) == int(score):
                                                         self.ratingButtonslist[panel_index][i][j].setChecked(True)
 
+    def _set_media(self, *options):
+        self.media = self.instance.media_new(self.video_path, *options)
+        self.mediaPlayer.set_media(self.media)
+        self.media.parse()
+
+    def _attach_video_output(self):
+        if platform.system() == "Windows":
+            self.mediaPlayer.set_hwnd(int(self.videowidget.winId()))
+        elif platform.system() == "Darwin":
+            self.mediaPlayer.set_nsobject(int(self.videowidget.winId()))
+        else:
+            self.mediaPlayer.set_xwindow(int(self.videowidget.winId()))
+
+    def toggle_performance_mode(self, enabled):
+        """Restart the player with or without PERFORMANCE_OPTIONS, keeping the place in the video.
+
+        VLC only reads these options when it starts.
+        """
+        instance = vlc.Instance("--no-audio", *(PERFORMANCE_OPTIONS if enabled else ()))
+        if instance is None:
+            QMessageBox.warning(self, "Performance mode", "This version of VLC doesn't support performance mode.")
+            self.performanceCheck.blockSignals(True)
+            self.performanceCheck.setChecked(False)
+            self.performanceCheck.blockSignals(False)
+            return
+
+        state = self.mediaPlayer.get_state()
+        time_ms = self._current_time_ms()
+        self._stop_for_restart(state)
+        self.mediaPlayer.release()
+        self.instance.release()
+
+        self.instance = instance
+        self.mediaPlayer = self.instance.media_player_new()
+        self._attach_video_output()
+        self.set_speed(self.playbackspeedBtn.currentIndex())
+        if self.media is not None:
+            self._resume_media(state, time_ms)
+
+    def _stop_for_restart(self, state):
+        self.timer.stop()
+        if state == vlc.State.Paused:
+            self.mediaPlayer.set_pause(0)  # VLC 3.0.12 can crash when stopped while paused
+        self.mediaPlayer.stop()
+        if self.media is not None:
+            self.media.release()
+
+    def _resume_media(self, state, time_ms):
+        """Load video_path and carry on from time_ms in the state the old player was in."""
+        if state not in (vlc.State.Paused, vlc.State.Opening, vlc.State.Buffering, vlc.State.Playing):
+            self._set_media()  # stopped: stay ready to play from the start
+            return
+        self._set_media(":start-time={}".format(time_ms / 1000))
+        # VLC reports time 0 when it starts paused, so it's paused in update_ui once it has really started
+        self._restarting = True
+        self._pause_after_restart = state == vlc.State.Paused
+        self.mediaPlayer.play()
+        self.timer.start()
+
+    # =========================================================================
+    # Lighter copy of a video, made with FFmpeg, for computers that can't play the original smoothly
+    # =========================================================================
+    def _lighter_copy_path(self):
+        return "{}/lighter_copy.mp4".format(self.save_directory)
+
+    def _update_video_title(self):
+        if self.video_path == self.original_path:
+            self.setWindowTitle(self.media.get_meta(0))
+        else:
+            self.setWindowTitle("{} (lighter copy)".format(self.vidname))
+
+    def _update_lighter_copy_button(self):
+        if self.copyProcess is not None:
+            text = "Cancel lighter copy"
+        elif self.video_path != self.original_path:
+            text = "Play original"
+        elif self.save_directory and os.path.exists(self._lighter_copy_path()):
+            text = "Play lighter copy"
+        else:
+            text = "Make lighter copy"
+        self.lighterCopyBtn.setText(text)
+        self.lighterCopyBtn.setEnabled(self.original_path is not None)
+
+    def on_lighter_copy_clicked(self):
+        if self.copyProcess is not None:
+            self._cancel_lighter_copy()
+        elif self.video_path != self.original_path:
+            self._switch_video(self.original_path)
+        elif os.path.exists(self._lighter_copy_path()):
+            self._switch_video(self._lighter_copy_path())
+        else:
+            self._start_lighter_copy()
+
+    def _switch_video(self, path):
+        """Play the original or the lighter copy instead, from the same time."""
+        state = self.mediaPlayer.get_state()
+        time_ms = self._current_time_ms()
+        self._stop_for_restart(state)
+        self.video_path = path
+        self._resume_media(state, time_ms)
+        self._update_video_title()
+        self._update_lighter_copy_button()
+
+    def _start_lighter_copy(self):
+        try:
+            import imageio_ffmpeg
+
+            ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        except (ImportError, RuntimeError):
+            QMessageBox.warning(
+                self,
+                "FFmpeg not found",
+                "To make lighter copies, run this in Anaconda Prompt, then restart SurgUI:\n\npip install imageio-ffmpeg",
+            )
+            return
+
+        self.copyDurationMs = self._duration_ms()
+        needed = self.copyDurationMs // 1000 * LIGHTER_COPY_BYTES_PER_SEC
+        if shutil.disk_usage(self.save_directory).free < needed:
+            QMessageBox.warning(
+                self,
+                "Not enough disk space",
+                "The copy needs about {} MB of free space.".format(needed // 1000000),
+            )
+            return
+
+        self.copyTarget = self._lighter_copy_path()
+        self.copyPart = "{}/lighter_copy.part.mp4".format(self.save_directory)
+        self.copyCancelled = False
+        self.copyProgress.setRange(0, 100 if self.copyDurationMs else 0)  # 0, 0: busy without a percentage
+        self.copyProgress.setValue(0)
+        self.copyProgress.show()
+
+        self.copyProcess = QProcess(self)
+        self.copyProcess.readyReadStandardOutput.connect(self._on_lighter_copy_output)
+        self.copyProcess.finished.connect(self._on_lighter_copy_finished)
+        self.copyProcess.errorOccurred.connect(self._on_lighter_copy_error)
+        self.copyProcess.start(
+            ffmpeg,
+            ["-y", "-hide_banner", "-nostdin", "-loglevel", "error", "-progress", "pipe:1", "-nostats"]
+            + ["-i", self.original_path]
+            + LIGHTER_COPY_ARGS
+            + [self.copyPart],
+        )
+        self._update_lighter_copy_button()
+
+    def _on_lighter_copy_output(self):
+        if self.copyProcess is None:
+            return
+        text = bytes(self.copyProcess.readAllStandardOutput()).decode("ascii", "ignore")
+        done = re.findall(r"out_time_ms=(\d+)", text)  # despite its name, in microseconds
+        if done and self.copyDurationMs:
+            self.copyProgress.setValue(min(99, int(done[-1]) // 10 // self.copyDurationMs))
+
+    def _on_lighter_copy_error(self, error):
+        if error == QProcess.FailedToStart:
+            self._on_lighter_copy_finished(-1, QProcess.CrashExit)
+
+    def _on_lighter_copy_finished(self, exit_code, exit_status):
+        process, self.copyProcess = self.copyProcess, None
+        if process is None:
+            return
+        self.copyProgress.hide()
+        error = None
+        if self.copyCancelled:
+            pass
+        elif exit_code != 0 or exit_status != QProcess.NormalExit:
+            error = "FFmpeg couldn't convert this video.\n\n" + bytes(process.readAllStandardError()).decode(errors="replace")[-400:]
+        else:
+            error = self._check_lighter_copy()
+        process.deleteLater()
+
+        if self.copyCancelled or error:
+            try:
+                if os.path.exists(self.copyPart):
+                    os.remove(self.copyPart)
+            except OSError as e:
+                print("Could not delete {}: {}".format(self.copyPart, e))
+        self._update_lighter_copy_button()
+        if error:
+            QMessageBox.warning(self, "Lighter copy not made", error)
+        elif not self.copyCancelled:
+            reply = QMessageBox.question(self, "Lighter copy ready", "Switch to the lighter copy now?")
+            if reply == QMessageBox.Yes and self.video_path == self.original_path:
+                self._switch_video(self.copyTarget)
+
+    def _check_lighter_copy(self):
+        """Put the finished copy in place if its length matches the original, or return what's wrong."""
+        media = self.instance.media_new(self.copyPart)
+        media.parse()
+        length = media.get_duration()
+        media.release()
+        if self.copyDurationMs and abs(length - self.copyDurationMs) > LIGHTER_COPY_MAX_LENGTH_DIFF_MS:
+            return (
+                "The copy's length ({}) doesn't match the original ({}), so times marked on it could be wrong. "
+                "Please use the original video, with Performance mode if it helps.".format(
+                    self._format_ms(max(0, length)), self._format_ms(self.copyDurationMs)
+                )
+            )
+        try:
+            os.replace(self.copyPart, self.copyTarget)
+        except OSError as e:
+            return "Could not save the copy: {}".format(e)
+        return None
+
+    def _cancel_lighter_copy(self):
+        """Ask, then stop making the copy. Returns False if the user wants it to carry on."""
+        reply = QMessageBox.question(self, "Lighter copy", "A lighter copy is still being made. Cancel it?")
+        if reply != QMessageBox.Yes:
+            return False
+        if self.copyProcess is not None:  # it may have finished while the question was open
+            self.copyCancelled = True
+            self.copyProcess.kill()
+            self.copyProcess.waitForFinished(5000)
+        return True
+
+    def closeEvent(self, event):
+        if self.copyProcess is not None and not self._cancel_lighter_copy():
+            event.ignore()
+            return
+        super().closeEvent(event)
+
     def play_video(self):
+        self._pause_after_restart = False  # the user decides from here
         if self.mediaPlayer.is_playing():
             self.mediaPlayer.pause()
             self.is_paused = True
@@ -723,6 +999,7 @@ class Window(QWidget):
             self.image_save_directory = self.parrentDirectory + "/" + self.vidname + "/images"
 
             print("Saving directory: ", self.parrentDirectory + "/" + self.vidname)
+            self._update_lighter_copy_button()
 
     def display_time(self):
         time_ = self.getSliderValue()
@@ -1150,7 +1427,7 @@ class Window(QWidget):
             t = self._duration_ms() or self._last_time_ms
         else:
             t = self.mediaPlayer.get_time()
-            if t < 0:
+            if t < 0 or (self._restarting and t == 0):
                 t = self._last_time_ms
         duration = self._duration_ms()
         if duration:
@@ -1366,15 +1643,20 @@ class Window(QWidget):
 
     def update_ui(self):
         state = self.mediaPlayer.get_state()
-        if state in (vlc.State.Opening, vlc.State.Buffering):
+        if state in (vlc.State.NothingSpecial, vlc.State.Opening, vlc.State.Buffering):
             return  # still starting up, don't mistake it for having stopped
+        if self._restarting and self.mediaPlayer.get_time() > 0:
+            self._restarting = False
+            if self._pause_after_restart:
+                self._pause_after_restart = False
+                self.mediaPlayer.set_pause(1)
         # Read the time now: once the player is stopped VLC only reports -1
         self._current_time_ms()
         self.d.setText(self.getDurationValue())
         media_pos = self.mediaPlayer.get_position()
         # Leave the slider alone while the user holds it: setValue on a pressed
         # slider emits sliderMoved, which would seek back to VLC's position
-        if media_pos >= 0 and not self.slider.isSliderDown():
+        if media_pos >= 0 and not self.slider.isSliderDown() and not self._restarting:
             self.slider.setValue(int(media_pos * 100000))
         if not self.mediaPlayer.is_playing():
             self.timer.stop()
@@ -1382,7 +1664,10 @@ class Window(QWidget):
                 self.stop()
 
     def stop(self):
+        self._restarting = False
+        self._pause_after_restart = False
         self.mediaPlayer.stop()
+        self._set_media()  # drop any start-time from performance mode, so the next play starts from the beginning
         self.playBtn.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
 
     def set_speed(self, i):

@@ -25,6 +25,7 @@ setup(
         'opencv-python',
         'python-vlc',
         'labelme',
+        'imageio-ffmpeg',
         # Add other dependencies here
     ],
     packages=find_packages(),
